@@ -33,3 +33,7 @@ easytier-panic.log
 
 # web
 node_modules
+
+.vite
+
+easytier-gui/src-tauri/*.dll

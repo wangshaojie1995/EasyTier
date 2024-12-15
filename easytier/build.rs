@@ -67,7 +67,14 @@ impl WindowsBuild {
 
     pub fn check_for_win() {
         // add third_party dir to link search path
-        println!("cargo:rustc-link-search=native=easytier/third_party/");
+        let target = std::env::var("TARGET").unwrap_or_default();
+
+        if target.contains("x86_64") {
+            println!("cargo:rustc-link-search=native=easytier/third_party/");
+        } else if target.contains("aarch64") {
+            println!("cargo:rustc-link-search=native=easytier/third_party/arm64/");
+        }
+
         let protoc_path = if let Some(o) = Self::check_protoc_exist() {
             println!("cargo:info=use os exist protoc: {:?}", o);
             o
