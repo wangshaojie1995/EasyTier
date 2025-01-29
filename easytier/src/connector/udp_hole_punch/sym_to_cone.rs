@@ -284,6 +284,7 @@ impl PunchSymToConeHoleClient {
                 BaseController {
                     timeout_ms: 4000,
                     trace_id: 0,
+                    ..Default::default()
                 },
                 req,
             )
@@ -314,6 +315,7 @@ impl PunchSymToConeHoleClient {
                 BaseController {
                     timeout_ms: 4000,
                     trace_id: 0,
+                    ..Default::default()
                 },
                 req,
             )
@@ -529,6 +531,7 @@ pub mod tests {
     };
 
     #[tokio::test]
+    #[serial_test::serial]
     #[serial_test::serial(hole_punch)]
     async fn hole_punching_symmetric_only_random() {
         RUN_TESTING.store(true, std::sync::atomic::Ordering::Relaxed);
