@@ -1,51 +1,192 @@
 import { v4 as uuidv4 } from 'uuid'
+import {
+  NetworkConfig as NetworkConfigPb,
+  NetworkingMethod,
+  type NetworkPeerConfig,
+  type NetworkConfig as ProtoNetworkConfig,
+  type PortForwardConfig,
+  type VpnPortalClientConfig,
+  type VpnPortalConfig,
+} from '../generated/proto/api_manage'
+import { ScalarType } from '@protobuf-ts/runtime'
+import { DnsRecordType, type DnsRecordRaw } from '../generated/proto/core_config'
+import type { FlagMeta } from '../generated/proto/annotations'
+import {
+  VpnPortalClientState,
+  VpnPortalInfo as VpnPortalInfoPb,
+  type VpnPortalClientInfo,
+  type VpnPortalInfo,
+} from '../generated/proto/api_instance'
+import {
+  Action as AclAction,
+  ChainType as AclChainType,
+  Protocol as AclProtocol,
+  type Acl,
+  type AclV1,
+  type Chain as AclChain,
+  type GroupIdentity,
+  type GroupInfo,
+  type Rule as AclRule,
+} from '../generated/proto/acl'
+import {
+  CompressionAlgoPb,
+  Flags as FlagsPb,
+  NatType,
+  type PeerFeatureFlag,
+  type Ipv6Inet,
+  type SecureModeConfig,
+} from '../generated/proto/common'
+import { prepareNetworkConfigForProtoJson } from './networkCompat'
 
-export enum NetworkingMethod {
-  PublicServer = 0,
-  Manual = 1,
-  Standalone = 2,
+export { AclAction, AclChainType, AclProtocol, CompressionAlgoPb, DnsRecordType, NatType, NetworkingMethod }
+export { VpnPortalClientState }
+export type { Acl, AclChain, AclRule, AclV1, GroupIdentity, GroupInfo, NetworkPeerConfig, PeerFeatureFlag, PortForwardConfig, SecureModeConfig, VpnPortalClientConfig, VpnPortalClientInfo, VpnPortalConfig, VpnPortalInfo }
+
+export const PEER_PROTOCOLS: { [proto: string]: number } = {
+  tcp: 11010,
+  udp: 11010,
+  wg: 11011,
+  ws: 11011,
+  wss: 11012,
+  quic: 11012,
+  faketcp: 11013,
+  http: 80,
+  https: 443,
+  txt: 0,
+  srv: 0,
 }
 
-export interface NetworkConfig {
+// Configuration JSON uses transparent repeated wrappers, as Rust Serde does.
+// Derive the value types from the protocol schema rather than copying fields.
+type ConfigJson<T> = T extends { items: Array<infer Item> }
+  ? ConfigJson<Item>[]
+  : T extends DnsRecordRaw
+    ? ConfigJson<Omit<T, 'type'>>
+      & { type: DnsRecordType | keyof typeof DnsRecordType }
+    : T extends object ? { [Key in keyof T]: ConfigJson<T[Key]> } : T
+
+export type DnsConfig = ConfigJson<NonNullable<ProtoNetworkConfig['dns']>>
+export type DnsRecord = ConfigJson<DnsRecordRaw>
+
+export type NetworkConfig = Omit<
+  ProtoNetworkConfig,
+  | 'instance_id'
+  | 'instance_recv_bps_limit'
+  | 'mtu'
+  | 'networking_method'
+  | 'dns'
+> & {
   instance_id: string
+  dns?: DnsConfig
+  mtu: number | null
+  instance_recv_bps_limit: number | string | null
+  networking_method: NetworkingMethod | string
+  /// Form-only field: an admin-issued credential secret for joining as a
+  /// temporary device. Saved as secure_mode.local_private_key with an empty
+  /// network_secret - the CLI `--credential` equivalent.
+  credential_secret?: string
+}
 
-  dhcp: boolean
-  virtual_ipv4: string
-  network_length: number
-  hostname?: string
-  network_name: string
-  network_secret: string
+export type NormalizedAclV1 = AclV1 & {
+  group: GroupInfo
+}
 
-  networking_method: NetworkingMethod
+const UINT64_MAX = (1n << 64n) - 1n
 
-  public_server_url: string
+interface NetworkingConfigFields {
   peer_urls: string[]
+  peers?: NetworkPeerConfig[]
+  public_server_url?: string
+  networking_method?: NetworkingMethod | string
+}
 
-  proxy_cidrs: string[]
+interface NetworkingMethodOptions {
+  fillPeerUrlsFromPeers?: boolean
+}
 
-  enable_vpn_portal: boolean
-  vpn_portal_listen_port: number
-  vpn_portal_client_network_addr: string
-  vpn_portal_client_network_len: number
+function emptyGroupInfo(): GroupInfo {
+  return {
+    declares: [],
+    members: [],
+  }
+}
 
-  advanced_settings: boolean
+function emptyAcl(): Acl {
+  return {
+    acl_v1: {
+      group: emptyGroupInfo(),
+      chains: [],
+    },
+  }
+}
 
-  listener_urls: string[]
-  rpc_port: number
-  latency_first: boolean
+/** A flag of `common.Flags` that carries an annotation. */
+interface AnnotatedFlag {
+  /** The name the management API uses for the flag. */
+  field: string
+  /** Whether the schema types the flag as a boolean. */
+  boolean: boolean
+  meta: FlagMeta
+}
 
-  dev_name: string
+const annotatedFlags: AnnotatedFlag[] = FlagsPb.fields.flatMap((flag) => {
+  const meta = flag.options?.['easytier.flag'] as FlagMeta | undefined
+  if (!meta) return []
 
-  use_smoltcp?: boolean
-  enable_kcp_proxy?: boolean
-  disable_kcp_input?: boolean
-  disable_p2p?: boolean
-  bind_device?: boolean
-  no_tun?: boolean
+  return [{
+    field: meta.api?.field ?? flag.name,
+    boolean: flag.kind === 'scalar' && flag.T === ScalarType.BOOL,
+    meta,
+  }]
+})
+
+/** The value a flag's annotation declares, as the flag itself is typed. */
+function declaredValue(flag: AnnotatedFlag): boolean {
+  const declared = flag.meta.default === 'true'
+
+  return flag.meta.api?.negate ? !declared : declared
+}
+
+/**
+ * The value a flag runs with when the configuration does not state one, so a
+ * form shows what an unset flag means instead of showing it as off.
+ */
+export function defaultFlagValue(field: keyof NetworkConfig): boolean {
+  const flag = annotatedFlags.find((flag) => flag.field === field)
+
+  return flag ? declaredValue(flag) : false
+}
+
+/** The flags the management API carries, so a form's value reaches the backend. */
+export function apiCarries(field: string): boolean {
+  return NetworkConfigPb.fields.some((declared) => declared.name === field)
+}
+
+/**
+ * The flags a config form offers as checkboxes, in schema order: every boolean
+ * flag the message declares that the management API carries, less the deprecated ones.
+ */
+export function formFlags(): { field: keyof NetworkConfig; help: string }[] {
+  return annotatedFlags
+    .filter((flag) => flag.boolean && !flag.meta.deprecated && apiCarries(flag.field))
+    .map((flag) => ({ field: flag.field as keyof NetworkConfig, help: `${flag.field}_help` }))
+}
+
+/** The value the schema declares for every boolean flag, by form field. */
+function newFlagValues(): Record<string, boolean> {
+  const values: Record<string, boolean> = {}
+  for (const flag of annotatedFlags) {
+    if (flag.boolean) values[flag.field] = declaredValue(flag)
+  }
+
+  return values
 }
 
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
   return {
+    ...NetworkConfigPb.create(),
+    dns: undefined,
+
     instance_id: uuidv4(),
 
     dhcp: true,
@@ -53,18 +194,13 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     network_length: 24,
     network_name: 'easytier',
     network_secret: '',
+    credential_file: '',
 
-    networking_method: NetworkingMethod.PublicServer,
-
-    public_server_url: 'tcp://public.easytier.top:11010',
+    networking_method: NetworkingMethod.Manual,
+    public_server_url: '',
     peer_urls: [],
 
     proxy_cidrs: [],
-
-    enable_vpn_portal: false,
-    vpn_portal_listen_port: 22022,
-    vpn_portal_client_network_addr: '',
-    vpn_portal_client_network_len: 24,
 
     advanced_settings: false,
 
@@ -73,17 +209,241 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
       'udp://0.0.0.0:11010',
       'wg://0.0.0.0:11011',
     ],
-    rpc_port: 0,
-    latency_first: false,
+    ...newFlagValues(),
     dev_name: '',
 
-    use_smoltcp: false,
-    enable_kcp_proxy: false,
-    disable_kcp_input: false,
-    disable_p2p: false,
-    bind_device: true,
-    no_tun: false,
+    ipv6_public_addr_auto: false,
+    enable_relay_network_whitelist: false,
+    relay_network_whitelist: [],
+    enable_manual_routes: false,
+    routes: [],
+    exit_nodes: [],
+    enable_socks5: false,
+    socks5_port: 1080,
+    mtu: null,
+    instance_recv_bps_limit: null,
+    mapped_listeners: [],
+    port_forwards: [],
+    acl: emptyAcl(),
   }
+}
+
+function cleanPeerUrls(urls: string[] | undefined): string[] {
+  return (urls ?? []).map((url) => url.trim()).filter((url) => url.length > 0)
+}
+
+function cleanNetworkPeers(peers: NetworkPeerConfig[] | undefined): NetworkPeerConfig[] {
+  return (peers ?? [])
+    .map((peer) => ({
+      ...peer,
+      uri: peer.uri.trim(),
+    }))
+    .filter((peer) => peer.uri.length > 0)
+}
+
+function peersFromUrls(urls: string[], existingPeers: NetworkPeerConfig[]): NetworkPeerConfig[] {
+  const peersByUri = new Map<string, NetworkPeerConfig>()
+  for (const peer of existingPeers) {
+    if (!peersByUri.has(peer.uri)) {
+      peersByUri.set(peer.uri, peer)
+    }
+  }
+
+  return urls.map((uri) => ({
+    ...(peersByUri.get(uri) ?? {}),
+    uri,
+  }))
+}
+
+export function ensureAclRuleLists(rule: AclRule): AclRule {
+  rule.ports ??= []
+  rule.source_ips ??= []
+  rule.destination_ips ??= []
+  rule.source_ports ??= []
+  rule.source_groups ??= []
+  rule.destination_groups ??= []
+  return rule
+}
+
+export function ensureAclChain(chain: AclChain): AclChain {
+  chain.rules ??= []
+  chain.rules.forEach(ensureAclRuleLists)
+  return chain
+}
+
+export function ensureGroupInfo(group: GroupInfo): GroupInfo {
+  group.declares ??= []
+  group.members ??= []
+  return group
+}
+
+export function ensureAclV1(acl: Acl): NormalizedAclV1 {
+  acl.acl_v1 ??= { chains: [], group: emptyGroupInfo() }
+  acl.acl_v1.chains ??= []
+  acl.acl_v1.chains.forEach(ensureAclChain)
+  acl.acl_v1.group = ensureGroupInfo(acl.acl_v1.group ?? emptyGroupInfo())
+  return acl.acl_v1 as NormalizedAclV1
+}
+
+function normalizeAcl(acl: Acl | undefined): Acl {
+  const source = acl ?? emptyAcl()
+  const aclV1 = source.acl_v1 ?? { chains: [], group: emptyGroupInfo() }
+  return {
+    ...source,
+    acl_v1: {
+      ...aclV1,
+      chains: (aclV1.chains ?? []).map((chain) => ({
+        ...chain,
+        rules: (chain.rules ?? []).map((rule) => ({ ...ensureAclRuleLists({ ...rule }) })),
+      })),
+      group: ensureGroupInfo({
+        ...(aclV1.group ?? emptyGroupInfo()),
+        declares: aclV1.group?.declares ?? [],
+        members: aclV1.group?.members ?? [],
+      }),
+    },
+  }
+}
+
+function isGroupInfoEmpty(group: GroupInfo | undefined): boolean {
+  return (group?.declares?.length ?? 0) === 0 && (group?.members?.length ?? 0) === 0
+}
+
+function isAclEmpty(acl: Acl | undefined): boolean {
+  const aclV1 = acl?.acl_v1
+  return !aclV1 || ((aclV1.chains?.length ?? 0) === 0 && isGroupInfoEmpty(aclV1.group))
+}
+
+function normalizeUint64ForInput(v: bigint | number | string | null | undefined): number | string | null {
+  if (v == null) return null
+
+  try {
+    const n = typeof v === 'bigint' ? v : BigInt(v)
+    if (n === 0n || n > UINT64_MAX) return null
+    return n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : n.toString()
+  } catch {
+    return null
+  }
+}
+
+function normalizeNumberForInput(v: number | string | null | undefined): number | null {
+  if (v == null) return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+function toBackendUint64(v: number | bigint | string | null | undefined): bigint | undefined {
+  if (v == null || v === '') return undefined
+  try {
+    const n = typeof v === 'bigint' ? v : BigInt(v)
+    return n > 0n && n <= UINT64_MAX ? n : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function applyNetworkingMethod(
+  config: NetworkingConfigFields,
+  options: NetworkingMethodOptions = {},
+): void {
+  const existingPeers = cleanNetworkPeers(config.peers)
+  config.peer_urls = cleanPeerUrls(config.peer_urls)
+  if (options.fillPeerUrlsFromPeers && config.peer_urls.length === 0 && existingPeers.length > 0) {
+    config.peer_urls = existingPeers.map((peer) => peer.uri)
+  }
+
+  const publicServerUrl = config.public_server_url?.trim() ?? ''
+  const networkingMethod = config.networking_method ?? NetworkingMethod.Manual
+
+  switch (networkingMethod) {
+    case NetworkingMethod.PublicServer:
+      config.peer_urls = publicServerUrl
+        ? [publicServerUrl]
+        : (options.fillPeerUrlsFromPeers ? existingPeers.map((peer) => peer.uri) : [])
+      break
+    case NetworkingMethod.Manual:
+      break
+    case NetworkingMethod.Standalone:
+    default:
+      config.peer_urls = []
+      break
+  }
+
+  config.networking_method = NetworkingMethod.Manual
+  config.public_server_url = ''
+  config.peers = peersFromUrls(config.peer_urls, existingPeers)
+}
+
+export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const normalized = NetworkConfigPb.fromJson(protoConfig as any, {
+    ignoreUnknownFields: true,
+  }) as unknown as NetworkConfig
+  normalized.dns = dns
+
+  applyNetworkingMethod(normalized, { fillPeerUrlsFromPeers: true })
+  normalized.mtu = normalizeNumberForInput(normalized.mtu)
+  normalized.instance_recv_bps_limit = normalizeUint64ForInput(
+    normalized.instance_recv_bps_limit as any,
+  )
+  normalized.proxy_cidrs ??= []
+  normalized.listener_urls ??= []
+  normalized.relay_network_whitelist ??= []
+  normalized.routes ??= []
+  normalized.exit_nodes ??= []
+  normalized.mapped_listeners ??= []
+  normalized.port_forwards ??= []
+  if (normalized.vpn_portal_config) {
+    normalized.vpn_portal_config.clients ??= []
+    normalized.vpn_portal_config.clients.forEach((client) => {
+      client.groups ??= []
+    })
+  }
+  normalized.acl = config.acl === undefined ? undefined : normalizeAcl(normalized.acl)
+
+  // A credential-mode instance (no network secret, private key from the
+  // admin-issued credential) surfaces its key in the form's credential
+  // field instead of a raw secure_mode key.
+  normalized.credential_secret = config.credential_secret
+  if (!normalized.network_secret && normalized.secure_mode?.local_private_key) {
+    normalized.credential_secret ??= normalized.secure_mode.local_private_key
+    normalized.secure_mode = { enabled: true }
+  }
+
+  return normalized
+}
+
+export function toBackendNetworkConfig(config: NetworkConfig): NetworkConfig {
+  const { dns, ...protoConfig } = prepareNetworkConfigForProtoJson(config)
+  const backend = NetworkConfigPb.fromJson(protoConfig as any, {
+    ignoreUnknownFields: true,
+  })
+
+  applyNetworkingMethod(backend)
+  backend.mtu = normalizeNumberForInput(config.mtu) ?? undefined
+  backend.instance_recv_bps_limit = toBackendUint64(config.instance_recv_bps_limit)
+  if (config.acl === undefined || isAclEmpty(config.acl)) {
+    backend.acl = undefined
+  }
+
+  // The form credential field compiles into the credential-identity shape:
+  // empty network secret plus secure mode keyed by the credential (the CLI
+  // `--credential` equivalent); the node derives the matching public key.
+  const credentialSecret = (config.credential_secret ?? '').trim()
+  if (credentialSecret) {
+    backend.network_secret = undefined
+    backend.secure_mode = { enabled: true, local_private_key: credentialSecret }
+  }
+
+  const result = NetworkConfigPb.toJson(backend, {
+    useProtoFieldName: true,
+  }) as unknown as NetworkConfig
+  if (dns !== undefined) result.dns = dns
+  return result
+}
+
+export function normalizeVpnPortalInfo(info: unknown): VpnPortalInfo {
+  return VpnPortalInfoPb.fromJson(info as any, { ignoreUnknownFields: true })
 }
 
 export interface NetworkInstance {
@@ -128,6 +488,7 @@ export interface Url {
 
 export interface NodeInfo {
   virtual_ipv4: Ipv4Inet,
+  virtual_ipv6?: Ipv6Inet,
   hostname: string
   version: string
   ips: {
@@ -150,13 +511,13 @@ export interface NodeInfo {
   }
   stun_info: StunInfo
   listeners: Url[]
-  vpn_portal_cfg?: string
+  peer_id: number
 }
 
 export interface StunInfo {
-  udp_nat_type: number
-  tcp_nat_type: number
-  last_update_time: number
+  udp_nat_type?: number | string
+  tcp_nat_type?: number | string
+  last_update_time?: number | string
 }
 
 export interface Route {
@@ -167,6 +528,7 @@ export interface Route {
   proxy_cidrs: string[]
   hostname: string
   stun_info?: StunInfo
+  feature_flag?: PeerFeatureFlag
   inst_id: string
   version: string
 }
@@ -174,6 +536,7 @@ export interface Route {
 export interface PeerInfo {
   peer_id: number
   conns: PeerConnInfo[]
+  default_conn_id?: CommonUuid
 }
 
 export interface PeerConnInfo {
@@ -184,7 +547,7 @@ export interface PeerConnInfo {
   features: string[]
   tunnel?: TunnelInfo
   stats?: PeerConnStats
-  loss_rate: number
+  loss_rate?: number | string
 }
 
 export interface PeerRoutePair {
@@ -192,19 +555,46 @@ export interface PeerRoutePair {
   peer?: PeerInfo
 }
 
+export interface UrlPb {
+  url: string
+}
+
 export interface TunnelInfo {
   tunnel_type: string
-  local_addr: string
-  remote_addr: string
+  local_addr: UrlPb
+  remote_addr: UrlPb
 }
 
 export interface PeerConnStats {
-  rx_bytes: number
-  tx_bytes: number
-  rx_packets: number
-  tx_packets: number
-  latency_us: number
+  rx_bytes: number | string
+  tx_bytes: number | string
+  rx_packets: number | string
+  tx_packets: number | string
+  latency_us: number | string
 }
+
+export interface CommonUuid {
+  part1?: number
+  part2?: number
+  part3?: number
+  part4?: number
+}
+
+// 添加新行
+export const addRow = (rows: PortForwardConfig[]) => {
+  rows.push({
+    proto: 'tcp',
+    bind_ip: '',
+    bind_port: 65535,
+    dst_ip: '',
+    dst_port: 65535,
+  });
+};
+
+// 删除行
+export const removeRow = (index: number, rows: PortForwardConfig[]) => {
+  rows.splice(index, 1);
+};
 
 export enum EventType {
   TunDeviceReady = 'TunDeviceReady', // string
@@ -224,9 +614,18 @@ export enum EventType {
   Connecting = 'Connecting', // any
   ConnectError = 'ConnectError', // string, string, string
 
+  VpnPortalStarted = 'VpnPortalStarted', // string
   VpnPortalClientConnected = 'VpnPortalClientConnected', // string, string
   VpnPortalClientDisconnected = 'VpnPortalClientDisconnected', // string, string, string
 
+  DhcpIpv6Changed = 'DhcpIpv6Changed',
+  DhcpIpv6Conflicted = 'DhcpIpv6Conflicted',
   DhcpIpv4Changed = 'DhcpIpv4Changed', // ipv4 | null, ipv4 | null
   DhcpIpv4Conflicted = 'DhcpIpv4Conflicted', // ipv4 | null
+
+  PortForwardAdded = 'PortForwardAdded', // PortForwardConfigPb
+
+  ProxyCidrsUpdated = 'ProxyCidrsUpdated', // string[], string[]
+
+  UdpBroadcastRelayStartResult = 'UdpBroadcastRelayStartResult', // { capture_backend?: string, error?: string }
 }

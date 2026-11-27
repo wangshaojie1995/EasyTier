@@ -1,24 +1,32 @@
-use std::collections::hash_map::DefaultHasher;
 use std::{
-    hash::Hasher,
+    collections::HashSet,
+    net::{IpAddr, Ipv6Addr},
     sync::{Arc, Mutex},
 };
 
-use crate::proto::cli::PeerConnInfo;
-use crate::proto::common::PeerFeatureFlag;
-use crossbeam::atomic::AtomicCell;
-
-use super::{
-    config::{ConfigLoader, Flags},
-    netns::NetNS,
-    network::IPCollector,
-    stun::{StunInfoCollector, StunInfoCollectorTrait},
-    PeerId,
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use easytier_core::connectivity::composite::ConnectorRuntime as _;
+use easytier_core::peers::public_ipv6::PublicIpv6Host;
+use easytier_core::socket::{NetNamespace, SocketContext};
+use easytier_core::tunnel::effective_encryption_uses_xor;
+use easytier_core::{
+    config::{PeerId, peers::PeerRuntimeSnapshot, runtime::CoreInstanceRuntimeConfig},
+    instance::{CoreInstanceConfig, CoreInstanceHostConfig},
 };
 
-pub type NetworkIdentity = crate::common::config::NetworkIdentity;
+use super::{
+    config::{ConfigLoader, Flags, NetworkIdentity},
+    netns::NetNS,
+};
+#[cfg(feature = "management")]
+use crate::proto::api::config::InstanceConfigPatch;
+use crate::proto::api::instance::PeerConnInfo;
+use crate::proto::common::PortForwardConfigPb;
+use crossbeam::atomic::AtomicCell;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "management", derive(serde::Serialize, serde::Deserialize))]
 pub enum GlobalCtxEvent {
     TunDeviceReady(String),
     TunDeviceError(String),
@@ -33,15 +41,39 @@ pub enum GlobalCtxEvent {
     ListenerAcceptFailed(url::Url, String), // (url, error message)
     ConnectionAccepted(String, String),  // (local url, remote url)
     ConnectionError(String, String, String), // (local url, remote url, error message)
+    ListenerPortMappingEstablished {
+        local_listener: url::Url,
+        mapped_listener: url::Url,
+        backend: String,
+    },
 
     Connecting(url::Url),
     ConnectError(String, String, String), // (dst, ip version, error message)
 
-    VpnPortalClientConnected(String, String), // (portal, client ip)
+    VpnPortalStarted(String),                    // (portal)
+    VpnPortalClientConnected(String, String),    // (portal, client ip)
     VpnPortalClientDisconnected(String, String), // (portal, client ip)
 
     DhcpIpv4Changed(Option<cidr::Ipv4Inet>, Option<cidr::Ipv4Inet>), // (old, new)
+    DhcpIpv6Changed(Option<cidr::Ipv6Inet>, Option<cidr::Ipv6Inet>), // (old, new)
+    DhcpIpv6Conflicted(Option<cidr::Ipv6Inet>),
     DhcpIpv4Conflicted(Option<cidr::Ipv4Inet>),
+    PublicIpv6Changed(Option<cidr::Ipv6Inet>, Option<cidr::Ipv6Inet>), // (old, new)
+    PublicIpv6RoutesUpdated(Vec<cidr::Ipv6Inet>, Vec<cidr::Ipv6Inet>), // (added, removed)
+
+    PortForwardAdded(PortForwardConfigPb),
+
+    #[cfg(feature = "management")]
+    ConfigPatched(InstanceConfigPatch),
+
+    ProxyCidrsUpdated(Vec<cidr::Ipv4Cidr>, Vec<cidr::Ipv4Cidr>), // (added, removed)
+
+    UdpBroadcastRelayStartResult {
+        capture_backend: Option<String>,
+        error: Option<String>,
+    },
+
+    CredentialChanged,
 }
 
 pub type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
@@ -57,20 +89,13 @@ pub struct GlobalCtx {
     event_bus: EventBus,
 
     cached_ipv4: AtomicCell<Option<cidr::Ipv4Inet>>,
-    cached_proxy_cidrs: AtomicCell<Option<Vec<cidr::IpCidr>>>,
+    cached_ipv6: AtomicCell<Option<cidr::Ipv6Inet>>,
+    hostname: Mutex<String>,
 
-    ip_collector: Arc<IPCollector>,
+    tun_device_name: Mutex<Option<String>>,
 
-    hostname: String,
-
-    stun_info_collection: Box<dyn StunInfoCollectorTrait>,
-
-    running_listeners: Mutex<Vec<url::Url>>,
-
-    enable_exit_node: bool,
-    no_tun: bool,
-
-    feature_flags: AtomicCell<PeerFeatureFlag>,
+    flags: ArcSwap<Flags>,
+    runtime_endpoint_protocols: Option<HashSet<String>>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -87,24 +112,88 @@ impl std::fmt::Debug for GlobalCtx {
 
 pub type ArcGlobalCtx = std::sync::Arc<GlobalCtx>;
 
+#[async_trait]
+impl PublicIpv6Host for GlobalCtx {
+    async fn collect_reserved_public_ipv6_addrs(
+        &self,
+        prefix: cidr::Ipv6Cidr,
+    ) -> HashSet<Ipv6Addr> {
+        let context = SocketContext::default()
+            .with_socket_mark(self.get_flags().socket_mark)
+            .with_netns(self.net_ns.name().map(NetNamespace::new));
+        let ip_list = crate::host_runtime::native_host_runtime()
+            .collect_ip_addrs(&context)
+            .await;
+        let mut reserved = HashSet::new();
+        reserved.extend(
+            ip_list
+                .interface_ipv6s
+                .into_iter()
+                .map(Ipv6Addr::from)
+                .filter(|addr| prefix.contains(addr)),
+        );
+        reserved.extend(
+            ip_list
+                .public_ipv6
+                .into_iter()
+                .map(Ipv6Addr::from)
+                .filter(|addr| prefix.contains(addr)),
+        );
+        reserved
+    }
+}
+
 impl GlobalCtx {
-    pub fn new(config_fs: impl ConfigLoader + 'static + Send + Sync) -> Self {
+    pub fn new(config_fs: impl ConfigLoader + 'static) -> Self {
+        Self::new_inner(config_fs, None, None)
+    }
+
+    pub(crate) fn new_with_runtime_config(
+        config_fs: impl ConfigLoader + 'static,
+        runtime: &CoreInstanceConfig,
+        host: &CoreInstanceHostConfig,
+    ) -> Self {
+        let runtime = CoreInstanceRuntimeConfig {
+            services: runtime.connectivity.runtime.clone(),
+            peer: Arc::new(runtime.peer.snapshot.clone()),
+        };
+        let protocols = host.ignore_unsupported_config.then(|| {
+            host.endpoint_protocols
+                .iter()
+                .map(|protocol| protocol.to_ascii_lowercase())
+                .collect()
+        });
+        Self::new_inner(config_fs, Some(&runtime), protocols)
+    }
+
+    fn new_inner(
+        config_fs: impl ConfigLoader + 'static,
+        runtime: Option<&CoreInstanceRuntimeConfig>,
+        runtime_endpoint_protocols: Option<HashSet<String>>,
+    ) -> Self {
         let id = config_fs.get_id();
         let network = config_fs.get_network_identity();
         let net_ns = NetNS::new(config_fs.get_netns());
-        let hostname = config_fs.get_hostname();
+        let hostname = runtime
+            .and_then(|runtime| runtime.peer.runtime.core.node.hostname.clone())
+            .unwrap_or_else(|| match config_fs.get_hostname() {
+                hostname if !hostname.is_empty() => hostname,
+                _ => gethostname::gethostname().to_string_lossy().to_string(),
+            });
+        let flags = runtime
+            .map(|runtime| runtime.peer.flags.clone())
+            .unwrap_or_else(|| config_fs.get_flags());
+        let ipv4 = runtime
+            .map(|runtime| Self::runtime_ipv4(&runtime.peer))
+            .unwrap_or_else(|| config_fs.get_ipv4().filter(|_| !config_fs.get_dhcp()));
+        let ipv6 = runtime
+            .map(|runtime| Self::runtime_ipv6(&runtime.peer))
+            .unwrap_or_else(|| config_fs.get_ipv6().filter(|_| !config_fs.get_dhcpv6()));
+        if flags.enable_encryption && effective_encryption_uses_xor(&flags.encryption_algorithm) {
+            tracing::warn!("using insecure XOR because no AEAD encryption is configured");
+        }
 
-        let (event_bus, _) = tokio::sync::broadcast::channel(1024);
-
-        let stun_info_collection = Arc::new(StunInfoCollector::new_with_default_servers());
-
-        let enable_exit_node = config_fs.get_flags().enable_exit_node;
-        let no_tun = config_fs.get_flags().no_tun;
-
-        let mut feature_flags = PeerFeatureFlag::default();
-        feature_flags.kcp_input = !config_fs.get_flags().disable_kcp_input;
-        feature_flags.no_relay_kcp = config_fs.get_flags().disable_relay_kcp;
-
+        let (event_bus, _) = tokio::sync::broadcast::channel(16);
         GlobalCtx {
             inst_name: config_fs.get_inst_name(),
             id,
@@ -113,22 +202,31 @@ impl GlobalCtx {
             network,
 
             event_bus,
-            cached_ipv4: AtomicCell::new(None),
-            cached_proxy_cidrs: AtomicCell::new(None),
+            cached_ipv4: AtomicCell::new(ipv4),
+            cached_ipv6: AtomicCell::new(ipv6),
+            hostname: Mutex::new(hostname),
 
-            ip_collector: Arc::new(IPCollector::new(net_ns, stun_info_collection.clone())),
+            tun_device_name: Mutex::new(None),
 
-            hostname,
-
-            stun_info_collection: Box::new(stun_info_collection),
-
-            running_listeners: Mutex::new(Vec::new()),
-
-            enable_exit_node,
-            no_tun,
-
-            feature_flags: AtomicCell::new(feature_flags),
+            flags: ArcSwap::new(Arc::new(flags)),
+            runtime_endpoint_protocols,
         }
+    }
+
+    pub(crate) fn runtime_ipv4(peer: &PeerRuntimeSnapshot) -> Option<cidr::Ipv4Inet> {
+        let prefix = peer.runtime.core.routes.ipv4.as_ref()?;
+        let IpAddr::V4(address) = prefix.address else {
+            return None;
+        };
+        cidr::Ipv4Inet::new(address, prefix.prefix_len).ok()
+    }
+
+    pub(crate) fn runtime_ipv6(peer: &PeerRuntimeSnapshot) -> Option<cidr::Ipv6Inet> {
+        let prefix = peer.runtime.core.routes.ipv6.as_ref()?;
+        let IpAddr::V6(address) = prefix.address else {
+            return None;
+        };
+        cidr::Ipv6Inet::new(address, prefix.prefix_len).ok()
     }
 
     pub fn subscribe(&self) -> EventBusSubscriber {
@@ -136,66 +234,73 @@ impl GlobalCtx {
     }
 
     pub fn issue_event(&self, event: GlobalCtxEvent) {
-        if self.event_bus.receiver_count() != 0 {
-            self.event_bus.send(event).unwrap();
-        } else {
-            tracing::warn!("No subscriber for event: {:?}", event);
+        if let Err(e) = self.event_bus.send(event.clone()) {
+            tracing::warn!(
+                "Failed to send event: {:?}, error: {:?}, receiver count: {}",
+                event,
+                e,
+                self.event_bus.receiver_count()
+            );
         }
     }
 
-    pub fn check_network_in_whitelist(&self, network_name: &str) -> Result<(), anyhow::Error> {
-        if self
-            .get_flags()
-            .relay_network_whitelist
-            .split(" ")
-            .map(wildmatch::WildMatch::new)
-            .any(|wl| wl.matches(network_name))
-        {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("network {} not in whitelist", network_name).into())
-        }
+    #[cfg(any(feature = "tun", test))]
+    fn set_tun_device_name(&self, name: Option<String>) {
+        *self.tun_device_name.lock().unwrap() = name;
+    }
+
+    #[cfg(any(feature = "tun", test))]
+    pub(crate) fn set_tun_device_ready(&self, name: String) {
+        self.set_tun_device_name(Some(name.clone()));
+        self.issue_event(GlobalCtxEvent::TunDeviceReady(name));
+    }
+
+    #[cfg(any(feature = "tun", test))]
+    pub(crate) fn set_tun_device_error(&self, error: String) {
+        self.set_tun_device_name(None);
+        self.issue_event(GlobalCtxEvent::TunDeviceError(error));
+    }
+
+    pub fn get_tun_device_name(&self) -> Option<String> {
+        self.tun_device_name.lock().unwrap().clone()
     }
 
     pub fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
-        if let Some(ret) = self.cached_ipv4.load() {
-            return Some(ret);
-        }
-        let addr = self.config.get_ipv4();
-        self.cached_ipv4.store(addr.clone());
-        return addr;
+        self.cached_ipv4.load()
     }
 
     pub fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
-        self.config.set_ipv4(addr);
-        self.cached_ipv4.store(None);
+        self.cached_ipv4.store(addr);
     }
 
-    pub fn add_proxy_cidr(&self, cidr: cidr::IpCidr) -> Result<(), std::io::Error> {
-        self.config.add_proxy_cidr(cidr);
-        self.cached_proxy_cidrs.store(None);
-        Ok(())
+    pub fn get_ipv6(&self) -> Option<cidr::Ipv6Inet> {
+        self.cached_ipv6.load()
     }
 
-    pub fn remove_proxy_cidr(&self, cidr: cidr::IpCidr) -> Result<(), std::io::Error> {
-        self.config.remove_proxy_cidr(cidr);
-        self.cached_proxy_cidrs.store(None);
-        Ok(())
+    pub fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
+        self.cached_ipv6.store(addr);
     }
 
-    pub fn get_proxy_cidrs(&self) -> Vec<cidr::IpCidr> {
-        if let Some(proxy_cidrs) = self.cached_proxy_cidrs.take() {
-            self.cached_proxy_cidrs.store(Some(proxy_cidrs.clone()));
-            return proxy_cidrs;
-        }
-
-        let ret = self.config.get_proxy_cidrs();
-        self.cached_proxy_cidrs.store(Some(ret.clone()));
-        ret
+    pub fn is_ip_local_ipv6(&self, ip: &std::net::Ipv6Addr) -> bool {
+        self.get_ipv6().map(|x| x.address() == *ip).unwrap_or(false)
     }
 
     pub fn get_id(&self) -> uuid::Uuid {
         self.config.get_id()
+    }
+
+    pub fn is_ip_in_same_network(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.get_ipv4().map(|x| x.contains(v4)).unwrap_or(false),
+            IpAddr::V6(v6) => self.get_ipv6().map(|x| x.contains(v6)).unwrap_or(false),
+        }
+    }
+
+    pub fn is_ip_local_virtual_ip(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.get_ipv4().map(|x| x.address() == *v4).unwrap_or(false),
+            IpAddr::V6(v6) => self.is_ip_local_ipv6(v6),
+        }
     }
 
     pub fn get_network_identity(&self) -> NetworkIdentity {
@@ -206,89 +311,53 @@ impl GlobalCtx {
         self.get_network_identity().network_name
     }
 
-    pub fn get_ip_collector(&self) -> Arc<IPCollector> {
-        self.ip_collector.clone()
-    }
-
     pub fn get_hostname(&self) -> String {
-        return self.hostname.clone();
+        return self.hostname.lock().unwrap().clone();
     }
 
-    pub fn get_stun_info_collector(&self) -> impl StunInfoCollectorTrait + '_ {
-        self.stun_info_collection.as_ref()
-    }
-
-    pub fn replace_stun_info_collector(&self, collector: Box<dyn StunInfoCollectorTrait>) {
-        // force replace the stun_info_collection without mut and drop the old one
-        let ptr = &self.stun_info_collection as *const Box<dyn StunInfoCollectorTrait>;
-        let ptr = ptr as *mut Box<dyn StunInfoCollectorTrait>;
-        unsafe {
-            std::ptr::drop_in_place(ptr);
-            #[allow(invalid_reference_casting)]
-            std::ptr::write(ptr, collector);
-        }
-    }
-
-    pub fn get_running_listeners(&self) -> Vec<url::Url> {
-        self.running_listeners.lock().unwrap().clone()
-    }
-
-    pub fn add_running_listener(&self, url: url::Url) {
-        let mut l = self.running_listeners.lock().unwrap();
-        if !l.contains(&url) {
-            l.push(url);
-        }
-    }
-
-    pub fn get_vpn_portal_cidr(&self) -> Option<cidr::Ipv4Cidr> {
-        self.config.get_vpn_portal_config().map(|x| x.client_cidr)
+    pub fn set_hostname(&self, hostname: String) {
+        *self.hostname.lock().unwrap() = hostname;
     }
 
     pub fn get_flags(&self) -> Flags {
-        self.config.get_flags()
+        self.flags.load().as_ref().clone()
     }
 
     pub fn set_flags(&self, flags: Flags) {
-        self.config.set_flags(flags);
+        self.flags.store(Arc::new(flags));
     }
 
-    pub fn get_128_key(&self) -> [u8; 16] {
-        let mut key = [0u8; 16];
-        let secret = self
-            .config
-            .get_network_identity()
-            .network_secret
-            .unwrap_or_default();
-        // fill key according to network secret
-        let mut hasher = DefaultHasher::new();
-        hasher.write(secret.as_bytes());
-        key[0..8].copy_from_slice(&hasher.finish().to_be_bytes());
-        hasher.write(&key[0..8]);
-        key[8..16].copy_from_slice(&hasher.finish().to_be_bytes());
-        hasher.write(&key[0..16]);
-        key
+    pub fn flags_arc(&self) -> Arc<Flags> {
+        self.flags.load_full()
     }
 
     pub fn enable_exit_node(&self) -> bool {
-        self.enable_exit_node
+        self.flags.load().enable_exit_node || cfg!(target_env = "ohos")
+    }
+
+    pub fn proxy_forward_by_system(&self) -> bool {
+        self.flags.load().proxy_forward_by_system
     }
 
     pub fn no_tun(&self) -> bool {
-        self.no_tun
+        self.flags.load().no_tun
     }
 
-    pub fn get_feature_flags(&self) -> PeerFeatureFlag {
-        self.feature_flags.load()
-    }
-
-    pub fn set_feature_flags(&self, flags: PeerFeatureFlag) {
-        self.feature_flags.store(flags);
+    pub fn runtime_mapped_listeners(&self) -> Vec<url::Url> {
+        let listeners = self.config.get_mapped_listeners();
+        let Some(protocols) = &self.runtime_endpoint_protocols else {
+            return listeners;
+        };
+        listeners
+            .into_iter()
+            .filter(|listener| protocols.contains(&listener.scheme().to_ascii_lowercase()))
+            .collect()
     }
 }
 
 #[cfg(test)]
 pub mod tests {
-    use crate::common::{config::TomlConfigLoader, new_peer_id};
+    use crate::common::config::TomlConfigLoader;
 
     use super::*;
 
@@ -298,19 +367,19 @@ pub mod tests {
         let global_ctx = GlobalCtx::new(config);
 
         let mut subscriber = global_ctx.subscribe();
-        let peer_id = new_peer_id();
-        global_ctx.issue_event(GlobalCtxEvent::PeerAdded(peer_id.clone()));
-        global_ctx.issue_event(GlobalCtxEvent::PeerRemoved(peer_id.clone()));
+        let peer_id = rand::random();
+        global_ctx.issue_event(GlobalCtxEvent::PeerAdded(peer_id));
+        global_ctx.issue_event(GlobalCtxEvent::PeerRemoved(peer_id));
         global_ctx.issue_event(GlobalCtxEvent::PeerConnAdded(PeerConnInfo::default()));
         global_ctx.issue_event(GlobalCtxEvent::PeerConnRemoved(PeerConnInfo::default()));
 
         assert_eq!(
             subscriber.recv().await.unwrap(),
-            GlobalCtxEvent::PeerAdded(peer_id.clone())
+            GlobalCtxEvent::PeerAdded(peer_id)
         );
         assert_eq!(
             subscriber.recv().await.unwrap(),
-            GlobalCtxEvent::PeerRemoved(peer_id.clone())
+            GlobalCtxEvent::PeerRemoved(peer_id)
         );
         assert_eq!(
             subscriber.recv().await.unwrap(),
@@ -322,13 +391,134 @@ pub mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_tun_device_name_tracks_explicit_runtime_state() {
+        let config = TomlConfigLoader::default();
+        let global_ctx = GlobalCtx::new(config);
+
+        assert_eq!(global_ctx.get_tun_device_name(), None);
+
+        global_ctx.issue_event(GlobalCtxEvent::TunDeviceReady("ignored".to_string()));
+        assert_eq!(global_ctx.get_tun_device_name(), None);
+
+        let mut subscriber = global_ctx.subscribe();
+
+        global_ctx.set_tun_device_ready("easytier0".to_string());
+        assert_eq!(
+            global_ctx.get_tun_device_name(),
+            Some("easytier0".to_string())
+        );
+        assert_eq!(
+            subscriber.recv().await.unwrap(),
+            GlobalCtxEvent::TunDeviceReady("easytier0".to_string())
+        );
+
+        global_ctx.set_tun_device_error("closed".to_string());
+        assert_eq!(global_ctx.get_tun_device_name(), None);
+        assert_eq!(
+            subscriber.recv().await.unwrap(),
+            GlobalCtxEvent::TunDeviceError("closed".to_string())
+        );
+    }
+
+    #[test]
+    fn host_hostname_fallback_does_not_materialize_in_toml() {
+        let config = TomlConfigLoader::default();
+        let global_ctx = GlobalCtx::new(config.clone());
+
+        assert!(!global_ctx.get_hostname().is_empty());
+        assert!(!config.dump().contains("hostname"));
+    }
+
+    #[test]
+    fn active_dhcp_ipv4_survives_declarative_config_replacement() {
+        let config = TomlConfigLoader::default();
+        config.set_dhcp(true);
+        let global_ctx = GlobalCtx::new(config.clone());
+        let lease = "10.144.144.7/24".parse().unwrap();
+
+        global_ctx.set_ipv4(Some(lease));
+        config.set_ipv4(None);
+
+        assert_eq!(global_ctx.get_ipv4(), Some(lease));
+    }
+
+    #[test]
+    fn dhcp_initial_addresses_match_normalized_runtime() {
+        for dhcp_ipv4 in [false, true] {
+            for dhcp_ipv6 in [false, true] {
+                let config =
+                    TomlConfigLoader::new_from_str("ipv4 = '10.20.0.7/24'\nipv6 = 'fd12::7/64'")
+                        .unwrap();
+                config.set_dhcp(dhcp_ipv4);
+                config.set_dhcpv6(dhcp_ipv6);
+                let global_ctx = GlobalCtx::new(config.clone());
+                let normalized =
+                    easytier_core::instance::CoreInstanceConfig::from_toml(&config).unwrap();
+                let routes = &normalized.peer.snapshot.runtime.core.routes;
+                assert_eq!(global_ctx.get_ipv4().is_some(), !dhcp_ipv4);
+                assert_eq!(global_ctx.get_ipv6().is_some(), !dhcp_ipv6);
+                assert_eq!(
+                    global_ctx.get_ipv4().map(|ip| ip.address().to_string()),
+                    routes.ipv4.as_ref().map(|ip| ip.address.to_string())
+                );
+                assert_eq!(
+                    global_ctx.get_ipv6().map(|ip| ip.address().to_string()),
+                    routes.ipv6.as_ref().map(|ip| ip.address.to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_state_does_not_rewrite_toml_config() {
+        let config = TomlConfigLoader::default();
+        let global_ctx = GlobalCtx::new(config.clone());
+        let mut runtime_flags = global_ctx.get_flags();
+        runtime_flags.enable_exit_node = true;
+
+        global_ctx.set_ipv4(Some("10.144.144.7/24".parse().unwrap()));
+        global_ctx.set_ipv6(Some("fd00::7/64".parse().unwrap()));
+        global_ctx.set_flags(runtime_flags);
+
+        assert_eq!(config.get_ipv4(), None);
+        assert_eq!(config.get_ipv6(), None);
+        assert!(!config.get_flags().enable_exit_node);
+        assert_eq!(
+            global_ctx.get_ipv4(),
+            Some("10.144.144.7/24".parse().unwrap())
+        );
+        assert_eq!(global_ctx.get_ipv6(), Some("fd00::7/64".parse().unwrap()));
+        assert!(global_ctx.get_flags().enable_exit_node);
+    }
+
+    #[test]
+    fn compact_runtime_does_not_advertise_unsupported_mapped_listeners() {
+        let config = TomlConfigLoader::default();
+        config.set_mapped_listeners(Some(vec![
+            "tcp://127.0.0.1:11010".parse().unwrap(),
+            "quic://127.0.0.1:11011".parse().unwrap(),
+        ]));
+        let host = crate::instance::config::compact_runtime_core_host_config();
+        let normalized =
+            easytier_core::instance::CoreInstanceConfig::from_toml_with_host(&config, &host)
+                .unwrap();
+
+        let global_ctx = GlobalCtx::new_with_runtime_config(config.clone(), &normalized, &host);
+
+        assert_eq!(config.get_mapped_listeners().len(), 2);
+        assert_eq!(global_ctx.runtime_mapped_listeners().len(), 1);
+        assert_eq!(global_ctx.runtime_mapped_listeners()[0].scheme(), "tcp");
+    }
+
     pub fn get_mock_global_ctx_with_network(
         network_identy: Option<NetworkIdentity>,
     ) -> ArcGlobalCtx {
         let config_fs = TomlConfigLoader::default();
         config_fs.set_inst_name(format!("test_{}", config_fs.get_id()));
-        config_fs.set_network_identity(network_identy.unwrap_or(NetworkIdentity::default()));
-        std::sync::Arc::new(GlobalCtx::new(config_fs))
+        config_fs.set_network_identity(network_identy.unwrap_or_default());
+
+        Arc::new(GlobalCtx::new(config_fs))
     }
 
     pub fn get_mock_global_ctx() -> ArcGlobalCtx {

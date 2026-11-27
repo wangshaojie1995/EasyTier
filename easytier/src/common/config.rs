@@ -1,639 +1,771 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::{Arc, Mutex},
+//! Native Adapters around the core-owned TOML configuration model.
+
+use std::path::PathBuf;
+
+use anyhow::Context as _;
+use strum::VariantArray as _;
+#[cfg(feature = "management")]
+use tokio::io::AsyncReadExt as _;
+
+use easytier_core::config::MappedListenerPolicy;
+#[cfg(feature = "management")]
+pub use easytier_core::config::api_input::{
+    NetworkConfig, NetworkConfigExt, NetworkingMethod, add_proxy_network_to_config,
 };
+pub use easytier_core::config::toml::*;
 
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "management")]
+use crate::common::env_parser;
+#[cfg(feature = "logging")]
+use crate::common::log;
+use crate::tunnel::IpScheme;
 
-use crate::{proto::common::CompressionAlgoPb, tunnel::generate_digest_from_str};
+#[cfg(feature = "management")]
+pub use easytier_core::management::{config_source_from_rpc, config_source_to_rpc};
 
-pub type Flags = crate::proto::common::FlagsInConfig;
-
-pub fn gen_default_flags() -> Flags {
-    Flags {
-        default_protocol: "tcp".to_string(),
-        dev_name: "".to_string(),
-        enable_encryption: true,
-        enable_ipv6: true,
-        mtu: 1380,
-        latency_first: false,
-        enable_exit_node: false,
-        no_tun: false,
-        use_smoltcp: false,
-        relay_network_whitelist: "*".to_string(),
-        disable_p2p: false,
-        relay_all_peer_rpc: false,
-        disable_udp_hole_punching: false,
-        ipv6_listener: "udp://[::]:0".to_string(),
-        multi_thread: true,
-        data_compress_algo: CompressionAlgoPb::None.into(),
-        bind_device: true,
-        enable_kcp_proxy: false,
-        disable_kcp_input: false,
-        disable_relay_kcp: true,
-    }
+pub fn mapped_listener_policy() -> MappedListenerPolicy {
+    MappedListenerPolicy::new(IpScheme::VARIANTS.iter().map(ToString::to_string))
 }
 
-#[auto_impl::auto_impl(Box, &)]
-pub trait ConfigLoader: Send + Sync {
-    fn get_id(&self) -> uuid::Uuid;
-    fn set_id(&self, id: uuid::Uuid);
-
-    fn get_hostname(&self) -> String;
-    fn set_hostname(&self, name: Option<String>);
-
-    fn get_inst_name(&self) -> String;
-    fn set_inst_name(&self, name: String);
-
-    fn get_netns(&self) -> Option<String>;
-    fn set_netns(&self, ns: Option<String>);
-
-    fn get_ipv4(&self) -> Option<cidr::Ipv4Inet>;
-    fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>);
-
-    fn get_dhcp(&self) -> bool;
-    fn set_dhcp(&self, dhcp: bool);
-
-    fn add_proxy_cidr(&self, cidr: cidr::IpCidr);
-    fn remove_proxy_cidr(&self, cidr: cidr::IpCidr);
-    fn get_proxy_cidrs(&self) -> Vec<cidr::IpCidr>;
-
-    fn get_network_identity(&self) -> NetworkIdentity;
-    fn set_network_identity(&self, identity: NetworkIdentity);
-
-    fn get_listener_uris(&self) -> Vec<url::Url>;
-
-    fn get_file_logger_config(&self) -> FileLoggerConfig;
-    fn set_file_logger_config(&self, config: FileLoggerConfig);
-    fn get_console_logger_config(&self) -> ConsoleLoggerConfig;
-    fn set_console_logger_config(&self, config: ConsoleLoggerConfig);
-
-    fn get_peers(&self) -> Vec<PeerConfig>;
-    fn set_peers(&self, peers: Vec<PeerConfig>);
-
-    fn get_listeners(&self) -> Vec<url::Url>;
-    fn set_listeners(&self, listeners: Vec<url::Url>);
-
-    fn get_mapped_listeners(&self) -> Vec<url::Url>;
-    fn set_mapped_listeners(&self, listeners: Option<Vec<url::Url>>);
-
-    fn get_rpc_portal(&self) -> Option<SocketAddr>;
-    fn set_rpc_portal(&self, addr: SocketAddr);
-
-    fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig>;
-    fn set_vpn_portal_config(&self, config: VpnPortalConfig);
-
-    fn get_flags(&self) -> Flags;
-    fn set_flags(&self, flags: Flags);
-
-    fn get_exit_nodes(&self) -> Vec<Ipv4Addr>;
-    fn set_exit_nodes(&self, nodes: Vec<Ipv4Addr>);
-
-    fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>>;
-    fn set_routes(&self, routes: Option<Vec<cidr::Ipv4Cidr>>);
-
-    fn get_socks5_portal(&self) -> Option<url::Url>;
-    fn set_socks5_portal(&self, addr: Option<url::Url>);
-
-    fn dump(&self) -> String;
+pub fn parse_mapped_listener_urls(
+    mapped_listeners: &[String],
+) -> Result<Vec<url::Url>, anyhow::Error> {
+    mapped_listener_policy().parse_urls(mapped_listeners)
 }
 
-pub type NetworkSecretDigest = [u8; 32];
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default, Eq, Hash)]
-pub struct NetworkIdentity {
-    pub network_name: String,
-    pub network_secret: Option<String>,
-    #[serde(skip)]
-    pub network_secret_digest: Option<NetworkSecretDigest>,
+pub fn load_toml_config_from_path(path: &PathBuf) -> Result<TomlConfigLoader, anyhow::Error> {
+    let config = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    load_toml_config_from_str_with_source(&path.display().to_string(), &config)
 }
 
-impl PartialEq for NetworkIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        if self.network_name != other.network_name {
-            return false;
-        }
-
-        if self.network_secret.is_some()
-            && other.network_secret.is_some()
-            && self.network_secret != other.network_secret
-        {
-            return false;
-        }
-
-        if self.network_secret_digest.is_some()
-            && other.network_secret_digest.is_some()
-            && self.network_secret_digest != other.network_secret_digest
-        {
-            return false;
-        }
-
-        return true;
-    }
-}
-
-impl NetworkIdentity {
-    pub fn new(network_name: String, network_secret: String) -> Self {
-        let mut network_secret_digest = [0u8; 32];
-        generate_digest_from_str(&network_name, &network_secret, &mut network_secret_digest);
-
-        NetworkIdentity {
-            network_name,
-            network_secret: Some(network_secret),
-            network_secret_digest: Some(network_secret_digest),
+pub fn load_toml_config_from_str_with_source(
+    source_name: &str,
+    config_str: &str,
+) -> Result<TomlConfigLoader, anyhow::Error> {
+    let config = TomlConfigLoader::new_from_str_with_source(source_name, config_str)?;
+    #[cfg(feature = "logging")]
+    {
+        let ignored_sections = ignored_logging_sections(config_str);
+        if !ignored_sections.is_empty() {
+            log::warn!(
+                config_source = source_name,
+                ?ignored_sections,
+                "Logging configuration in TOML is ignored because logging is process-wide. \
+                 Use command-line options (e.g. --console-log-level, --file-log-level, --file-log-dir) \
+                 or ET_* logging environment variables instead."
+            );
         }
     }
-
-    pub fn default() -> Self {
-        Self::new("default".to_string(), "".to_string())
-    }
+    Ok(config)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct PeerConfig {
-    pub uri: url::Url,
+#[cfg(any(feature = "logging", test))]
+fn ignored_logging_sections(config_str: &str) -> Vec<&'static str> {
+    let Ok(config) = toml::from_str::<toml::Table>(config_str) else {
+        return Vec::new();
+    };
+    ["file_logger", "console_logger"]
+        .into_iter()
+        .filter(|section| config.contains_key(*section))
+        .collect()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct ProxyNetworkConfig {
-    pub cidr: String,
-    pub allow: Option<Vec<String>>,
-}
+#[cfg(feature = "management-rpc")]
+pub use easytier_core::management::{ConfigFileControl, ConfigFilePermission};
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
-pub struct FileLoggerConfig {
-    pub level: Option<String>,
-    pub file: Option<String>,
-    pub dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
-pub struct ConsoleLoggerConfig {
-    pub level: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct VpnPortalConfig {
-    pub client_cidr: cidr::Ipv4Cidr,
-    pub wireguard_listen: SocketAddr,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-struct Config {
-    netns: Option<String>,
-    hostname: Option<String>,
-    instance_name: Option<String>,
-    instance_id: Option<uuid::Uuid>,
-    ipv4: Option<String>,
-    dhcp: Option<bool>,
-    network_identity: Option<NetworkIdentity>,
-    listeners: Option<Vec<url::Url>>,
-    mapped_listeners: Option<Vec<url::Url>>,
-    exit_nodes: Option<Vec<Ipv4Addr>>,
-
-    peer: Option<Vec<PeerConfig>>,
-    proxy_network: Option<Vec<ProxyNetworkConfig>>,
-
-    file_logger: Option<FileLoggerConfig>,
-    console_logger: Option<ConsoleLoggerConfig>,
-
-    rpc_portal: Option<SocketAddr>,
-
-    vpn_portal_config: Option<VpnPortalConfig>,
-
-    routes: Option<Vec<cidr::Ipv4Cidr>>,
-
-    socks5_proxy: Option<url::Url>,
-
-    flags: Option<serde_json::Map<String, serde_json::Value>>,
-
-    #[serde(skip)]
-    flags_struct: Option<Flags>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TomlConfigLoader {
-    config: Arc<Mutex<Config>>,
-}
-
-impl Default for TomlConfigLoader {
-    fn default() -> Self {
-        TomlConfigLoader::new_from_str("").unwrap()
-    }
-}
-
-impl TomlConfigLoader {
-    pub fn new_from_str(config_str: &str) -> Result<Self, anyhow::Error> {
-        let mut config = toml::de::from_str::<Config>(config_str)
-            .with_context(|| format!("failed to parse config file: {}", config_str))?;
-
-        config.flags_struct = Some(Self::gen_flags(config.flags.clone().unwrap_or_default()));
-
-        Ok(TomlConfigLoader {
-            config: Arc::new(Mutex::new(config)),
-        })
-    }
-
-    pub fn new(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
-        let config_str = std::fs::read_to_string(config_path)
-            .with_context(|| format!("failed to read config file: {:?}", config_path))?;
-        let ret = Self::new_from_str(&config_str)?;
-        let old_ns = ret.get_network_identity();
-        ret.set_network_identity(NetworkIdentity::new(
-            old_ns.network_name,
-            old_ns.network_secret.unwrap_or_default(),
-        ));
-
-        Ok(ret)
-    }
-
-    fn gen_flags(mut flags_hashmap: serde_json::Map<String, serde_json::Value>) -> Flags {
-        let default_flags_json = serde_json::to_string(&gen_default_flags()).unwrap();
-        let default_flags_hashmap =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&default_flags_json)
-                .unwrap();
-
-        let mut merged_hashmap = serde_json::Map::new();
-        for (key, value) in default_flags_hashmap {
-            if let Some(v) = flags_hashmap.remove(&key) {
-                merged_hashmap.insert(key, v);
-            } else {
-                merged_hashmap.insert(key, value);
-            }
-        }
-
-        serde_json::from_value(serde_json::Value::Object(merged_hashmap)).unwrap()
-    }
-}
-
-impl ConfigLoader for TomlConfigLoader {
-    fn get_inst_name(&self) -> String {
-        self.config
-            .lock()
-            .unwrap()
-            .instance_name
-            .clone()
-            .unwrap_or("default".to_string())
-    }
-
-    fn set_inst_name(&self, name: String) {
-        self.config.lock().unwrap().instance_name = Some(name);
-    }
-
-    fn get_hostname(&self) -> String {
-        let hostname = self.config.lock().unwrap().hostname.clone();
-
-        match hostname {
-            Some(hostname) => {
-                let hostname = hostname
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(32)
-                    .collect::<String>();
-
-                if !hostname.is_empty() {
-                    self.set_hostname(Some(hostname.clone()));
-                    hostname
-                } else {
-                    self.set_hostname(None);
-                    gethostname::gethostname().to_string_lossy().to_string()
-                }
-            }
-            None => gethostname::gethostname().to_string_lossy().to_string(),
-        }
-    }
-
-    fn set_hostname(&self, name: Option<String>) {
-        self.config.lock().unwrap().hostname = name;
-    }
-
-    fn get_netns(&self) -> Option<String> {
-        self.config.lock().unwrap().netns.clone()
-    }
-
-    fn set_netns(&self, ns: Option<String>) {
-        self.config.lock().unwrap().netns = ns;
-    }
-
-    fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
-        let locked_config = self.config.lock().unwrap();
-        locked_config
-            .ipv4
-            .as_ref()
-            .map(|s| s.parse().ok())
-            .flatten()
-            .map(|c: cidr::Ipv4Inet| {
-                if c.network_length() == 32 {
-                    cidr::Ipv4Inet::new(c.address(), 24).unwrap()
-                } else {
-                    c
-                }
-            })
-    }
-
-    fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
-        self.config.lock().unwrap().ipv4 = if let Some(addr) = addr {
-            Some(addr.to_string())
+#[cfg(feature = "management")]
+pub async fn config_file_control_from_path(path: PathBuf) -> ConfigFileControl {
+    let read_only = tokio::fs::metadata(&path)
+        .await
+        .map(|metadata| metadata.permissions().readonly())
+        .unwrap_or(true);
+    ConfigFileControl::new(
+        Some(path),
+        if read_only {
+            ConfigFilePermission::from(ConfigFilePermission::READ_ONLY)
         } else {
-            None
-        };
+            ConfigFilePermission::default()
+        },
+    )
+}
+
+#[cfg(feature = "management")]
+pub async fn load_config_from_file(
+    config_file: &PathBuf,
+    config_dir: Option<&PathBuf>,
+    disable_env_parsing: bool,
+) -> Result<(TomlConfigLoader, ConfigFileControl), anyhow::Error> {
+    if config_file.as_os_str() == "-" {
+        let mut stdin = String::new();
+        tokio::io::stdin()
+            .read_to_string(&mut stdin)
+            .await
+            .context("failed to read config from stdin")?;
+        let config = load_toml_config_from_str_with_source("stdin", &stdin)?;
+        return Ok((config, ConfigFileControl::STATIC_CONFIG));
     }
 
-    fn get_dhcp(&self) -> bool {
-        self.config.lock().unwrap().dhcp.unwrap_or_default()
+    let config_str = tokio::fs::read_to_string(config_file)
+        .await
+        .with_context(|| format!("failed to read config file: {}", config_file.display()))?;
+    let (expanded_config_str, uses_env_vars) = if disable_env_parsing {
+        (config_str, false)
+    } else {
+        env_parser::expand_env_vars(&config_str)
+    };
+
+    if disable_env_parsing {
+        tracing::info!(?config_file, "environment variable parsing is disabled");
+    } else if uses_env_vars {
+        tracing::info!(?config_file, "environment variables detected and expanded");
     }
 
-    fn set_dhcp(&self, dhcp: bool) {
-        self.config.lock().unwrap().dhcp = Some(dhcp);
+    let source_name = config_file.display().to_string();
+    let config = load_toml_config_from_str_with_source(&source_name, &expanded_config_str)?;
+    let mut control = config_file_control_from_path(config_file.clone()).await;
+
+    if uses_env_vars {
+        control.set_read_only(true);
+        control.set_no_delete(true);
+    } else if control.is_read_only() {
+        control.set_no_delete(true);
+    } else if let Some(config_dir) = config_dir {
+        let is_managed_file = config_file.parent() == Some(config_dir.as_path())
+            && config_file.file_stem() == Some(config.get_id().to_string().as_ref())
+            && config_file.extension() == Some(std::ffi::OsStr::new("toml"));
+        control.set_no_delete(!is_managed_file);
+    } else {
+        control.set_no_delete(true);
     }
 
-    fn add_proxy_cidr(&self, cidr: cidr::IpCidr) {
-        let mut locked_config = self.config.lock().unwrap();
-        if locked_config.proxy_network.is_none() {
-            locked_config.proxy_network = Some(vec![]);
+    Ok((config, control))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[test]
+    fn detects_only_top_level_logging_sections() {
+        let cases: [(&str, &[&str]); 6] = [
+            ("", &[]),
+            ("[file_logger]\nlevel = \"info\"", &["file_logger"]),
+            ("console_logger = { level = \"warn\" }", &["console_logger"]),
+            (
+                "[console_logger]\n[file_logger]",
+                &["file_logger", "console_logger"],
+            ),
+            ("# [file_logger]\ninstance_name = '[console_logger]'", &[]),
+            ("[unknown.file_logger]\nlevel = \"info\"", &[]),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(ignored_logging_sections(input), expected, "{input}");
         }
-        let cidr_str = cidr.to_string();
-        // insert if no duplicate
-        if !locked_config
-            .proxy_network
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|c| c.cidr == cidr_str)
-        {
-            locked_config
-                .proxy_network
-                .as_mut()
-                .unwrap()
-                .push(ProxyNetworkConfig {
-                    cidr: cidr_str,
-                    allow: None,
-                });
-        }
     }
 
-    fn remove_proxy_cidr(&self, cidr: cidr::IpCidr) {
-        let mut locked_config = self.config.lock().unwrap();
-        if let Some(proxy_cidrs) = &mut locked_config.proxy_network {
-            let cidr_str = cidr.to_string();
-            proxy_cidrs.retain(|c| c.cidr != cidr_str);
-        }
+    #[test]
+    fn ignored_logging_values_do_not_change_config_validation() {
+        let input = r#"
+instance_name = "legacy-logging"
+file_logger = "ignored"
+[console_logger]
+level = 123
+"#;
+        let config = load_toml_config_from_str_with_source("legacy.toml", input).unwrap();
+
+        assert_eq!(config.get_inst_name(), "legacy-logging");
+        assert_eq!(
+            ignored_logging_sections(input),
+            ["file_logger", "console_logger"]
+        );
     }
 
-    fn get_proxy_cidrs(&self) -> Vec<cidr::IpCidr> {
-        self.config
-            .lock()
-            .unwrap()
-            .proxy_network
-            .as_ref()
-            .map(|v| {
-                v.iter()
-                    .map(|c| c.cidr.parse().unwrap())
-                    .collect::<Vec<cidr::IpCidr>>()
-            })
-            .unwrap_or_default()
+    #[test]
+    fn path_adapter_preserves_file_name_in_parse_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "dhcp = \"yes\"").unwrap();
+
+        let error = load_toml_config_from_path(&file.path().to_path_buf())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(file.path().to_string_lossy().as_ref()));
+        assert!(error.contains("dhcp = \"yes\""));
     }
 
-    fn get_id(&self) -> uuid::Uuid {
-        let mut locked_config = self.config.lock().unwrap();
-        if locked_config.instance_id.is_none() {
-            let id = uuid::Uuid::new_v4();
-            locked_config.instance_id = Some(id);
-            id
-        } else {
-            locked_config.instance_id.as_ref().unwrap().clone()
-        }
-    }
+    #[tokio::test]
+    async fn file_adapter_keeps_os_metadata_outside_core_config() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "instance_name = \"from-file\"").unwrap();
 
-    fn set_id(&self, id: uuid::Uuid) {
-        self.config.lock().unwrap().instance_id = Some(id);
-    }
+        let (config, control) = load_config_from_file(&file.path().to_path_buf(), None, true)
+            .await
+            .unwrap();
 
-    fn get_network_identity(&self) -> NetworkIdentity {
-        self.config
-            .lock()
-            .unwrap()
-            .network_identity
-            .clone()
-            .unwrap_or_else(NetworkIdentity::default)
-    }
-
-    fn set_network_identity(&self, identity: NetworkIdentity) {
-        self.config.lock().unwrap().network_identity = Some(identity);
-    }
-
-    fn get_listener_uris(&self) -> Vec<url::Url> {
-        self.config
-            .lock()
-            .unwrap()
-            .listeners
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn get_file_logger_config(&self) -> FileLoggerConfig {
-        self.config
-            .lock()
-            .unwrap()
-            .file_logger
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_file_logger_config(&self, config: FileLoggerConfig) {
-        self.config.lock().unwrap().file_logger = Some(config);
-    }
-
-    fn get_console_logger_config(&self) -> ConsoleLoggerConfig {
-        self.config
-            .lock()
-            .unwrap()
-            .console_logger
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_console_logger_config(&self, config: ConsoleLoggerConfig) {
-        self.config.lock().unwrap().console_logger = Some(config);
-    }
-
-    fn get_peers(&self) -> Vec<PeerConfig> {
-        self.config.lock().unwrap().peer.clone().unwrap_or_default()
-    }
-
-    fn set_peers(&self, peers: Vec<PeerConfig>) {
-        self.config.lock().unwrap().peer = Some(peers);
-    }
-
-    fn get_listeners(&self) -> Vec<url::Url> {
-        self.config
-            .lock()
-            .unwrap()
-            .listeners
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_listeners(&self, listeners: Vec<url::Url>) {
-        self.config.lock().unwrap().listeners = Some(listeners);
-    }
-
-    fn get_mapped_listeners(&self) -> Vec<url::Url> {
-        self.config
-            .lock()
-            .unwrap()
-            .mapped_listeners
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_mapped_listeners(&self, listeners: Option<Vec<url::Url>>) {
-        self.config.lock().unwrap().mapped_listeners = listeners;
-    }
-
-    fn get_rpc_portal(&self) -> Option<SocketAddr> {
-        self.config.lock().unwrap().rpc_portal
-    }
-
-    fn set_rpc_portal(&self, addr: SocketAddr) {
-        self.config.lock().unwrap().rpc_portal = Some(addr);
-    }
-
-    fn get_vpn_portal_config(&self) -> Option<VpnPortalConfig> {
-        self.config.lock().unwrap().vpn_portal_config.clone()
-    }
-    fn set_vpn_portal_config(&self, config: VpnPortalConfig) {
-        self.config.lock().unwrap().vpn_portal_config = Some(config);
-    }
-
-    fn get_flags(&self) -> Flags {
-        self.config
-            .lock()
-            .unwrap()
-            .flags_struct
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_flags(&self, flags: Flags) {
-        self.config.lock().unwrap().flags_struct = Some(flags);
-    }
-
-    fn get_exit_nodes(&self) -> Vec<Ipv4Addr> {
-        self.config
-            .lock()
-            .unwrap()
-            .exit_nodes
-            .clone()
-            .unwrap_or_default()
-    }
-
-    fn set_exit_nodes(&self, nodes: Vec<Ipv4Addr>) {
-        self.config.lock().unwrap().exit_nodes = Some(nodes);
-    }
-
-    fn dump(&self) -> String {
-        let default_flags_json = serde_json::to_string(&gen_default_flags()).unwrap();
-        let default_flags_hashmap =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&default_flags_json)
-                .unwrap();
-
-        let cur_flags_json = serde_json::to_string(&self.get_flags()).unwrap();
-        let cur_flags_hashmap =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&cur_flags_json)
-                .unwrap();
-
-        let mut flag_map: serde_json::Map<String, serde_json::Value> = Default::default();
-        for (key, value) in default_flags_hashmap {
-            if let Some(v) = cur_flags_hashmap.get(&key) {
-                if *v != value {
-                    flag_map.insert(key, v.clone());
-                }
-            }
-        }
-
-        let mut config = self.config.lock().unwrap().clone();
-        config.flags = Some(flag_map);
-        toml::to_string_pretty(&config).unwrap()
-    }
-
-    fn get_routes(&self) -> Option<Vec<cidr::Ipv4Cidr>> {
-        self.config.lock().unwrap().routes.clone()
-    }
-
-    fn set_routes(&self, routes: Option<Vec<cidr::Ipv4Cidr>>) {
-        self.config.lock().unwrap().routes = routes;
-    }
-
-    fn get_socks5_portal(&self) -> Option<url::Url> {
-        self.config.lock().unwrap().socks5_proxy.clone()
-    }
-
-    fn set_socks5_portal(&self, addr: Option<url::Url>) {
-        self.config.lock().unwrap().socks5_proxy = addr;
+        assert_eq!(config.get_inst_name(), "from-file");
+        assert_eq!(control.path.as_deref(), Some(file.path()));
     }
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::*;
+mod compatibility_tests {
+    use std::{io::Write as _, path::PathBuf};
 
+    use tempfile::NamedTempFile;
+
+    use super::*;
+    use crate::tests::{remove_env_var, set_env_var};
+    /// 配置文件环境变量解析功能的集成测试
+    ///
+    /// 测试范围：
+    /// 1. 配置加载功能测试（环境变量替换、权限标记）
+    /// 2. RPC API 安全测试（只读配置保护）
+    /// 3. CLI 参数测试（--disable-env-parsing 开关）
+    /// 4. 多实例隔离测试
+    /// 5. 实际配置字段测试（network_secret、peer.uri 等）
+    /// 配置加载功能测试（环境变量替换、权限标记）
+    ///
+    /// 验证：
+    /// - 环境变量能正确替换到配置中
+    /// - 包含环境变量的配置文件自动标记为只读和禁止删除
     #[tokio::test]
-    async fn full_example_test() {
-        let config_str = r#"
-instance_name = "default"
-instance_id = "87ede5a2-9c3d-492d-9bbe-989b9d07e742"
-ipv4 = "10.144.144.10"
-listeners = [ "tcp://0.0.0.0:11010", "udp://0.0.0.0:11010" ]
-routes = [ "192.168.0.0/16" ]
+    async fn test_env_var_expansion_and_readonly_flag() {
+        // 设置测试环境变量
+        set_env_var("TEST_SECRET", "my-test-secret-123");
+        set_env_var("TEST_NETWORK", "test-network");
+
+        // 创建临时配置文件，包含环境变量占位符
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "test-instance"
 
 [network_identity]
-network_name = "default"
-network_secret = ""
-
-[[peer]]
-uri = "tcp://public.kkrainbow.top:11010"
-
-[[peer]]
-uri = "udp://192.168.94.33:11010"
-
-[[proxy_network]]
-cidr = "10.147.223.0/24"
-allow = ["tcp", "udp", "icmp"]
-
-[[proxy_network]]
-cidr = "10.1.1.0/24"
-allow = ["tcp", "icmp"]
-
-[file_logger]
-level = "info"
-file = "easytier"
-dir = "/tmp/easytier"
-
-[console_logger]
-level = "warn"
+network_name = "${TEST_NETWORK}"
+network_secret = "${TEST_SECRET}"
 "#;
-        let ret = TomlConfigLoader::new_from_str(config_str);
-        if let Err(e) = &ret {
-            println!("{}", e);
-        } else {
-            println!("{:?}", ret.as_ref().unwrap());
-        }
-        assert!(ret.is_ok());
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
 
-        let ret = ret.unwrap();
-        assert_eq!("10.144.144.10/24", ret.get_ipv4().unwrap().to_string());
+        let config_path = PathBuf::from(temp_file.path());
 
+        // 加载配置（启用环境变量解析）
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证环境变量已被替换
+        let network_identity = config.get_network_identity();
+        assert_eq!(network_identity.network_name, "test-network");
         assert_eq!(
-            vec!["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"],
-            ret.get_listener_uris()
-                .iter()
-                .map(|u| u.to_string())
-                .collect::<Vec<String>>()
+            network_identity.network_secret.as_ref().unwrap(),
+            "my-test-secret-123"
         );
 
-        println!("{}", ret.dump());
+        // 验证权限标记：包含环境变量的配置应被标记为只读和禁止删除
+        assert!(
+            control.is_read_only(),
+            "Config with env vars should be marked as READ_ONLY"
+        );
+        assert!(
+            control.is_no_delete(),
+            "Config with env vars should be marked as NO_DELETE"
+        );
+
+        // 清理环境变量
+        remove_env_var("TEST_SECRET");
+        remove_env_var("TEST_NETWORK");
+    }
+
+    /// RPC API 安全测试（只读配置保护）
+    ///
+    /// 验证：
+    /// - 只读配置不会通过 RPC API 暴露给远程调用
+    /// - 这需要测试 get_network_instance_config 拒绝返回只读配置
+    ///
+    /// 注：这个测试验证权限标记的正确设置，实际的 RPC API 保护已在
+    /// `easytier/src/rpc_service/instance_manage.rs` 中实现
+    #[tokio::test]
+    async fn test_readonly_config_api_protection() {
+        set_env_var("API_TEST_SECRET", "secret-value");
+
+        // 创建包含环境变量的配置
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "api-test"
+
+[network_identity]
+network_name = "api-network"
+network_secret = "${API_TEST_SECRET}"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+
+        // 加载配置
+        let (_config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证只读标记已设置（这是 RPC API 保护的前提）
+        assert!(
+            control.is_read_only(),
+            "Config should be marked as READ_ONLY for RPC protection"
+        );
+        assert!(
+            control.permission.has_flag(ConfigFilePermission::READ_ONLY),
+            "Permission flag should be set correctly"
+        );
+
+        remove_env_var("API_TEST_SECRET");
+    }
+
+    /// CLI 参数测试（--disable-env-parsing 开关）
+    ///
+    /// 验证：
+    /// - disable_env_parsing = true 时，环境变量不会被替换
+    /// - 配置不会被标记为只读
+    #[tokio::test]
+    async fn test_disable_env_parsing_flag() {
+        set_env_var("DISABLED_TEST_VAR", "should-not-expand");
+
+        // 创建包含环境变量占位符的配置
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "disable-test"
+
+[network_identity]
+network_name = "test"
+network_secret = "${DISABLED_TEST_VAR}"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+
+        // 以 disable_env_parsing = true 加载配置
+        let (config, control) = load_config_from_file(&config_path, None, true)
+            .await
+            .unwrap();
+
+        // 验证环境变量未被替换（保持原样）
+        let network_identity = config.get_network_identity();
+        assert_eq!(
+            network_identity.network_secret.as_ref().unwrap(),
+            "${DISABLED_TEST_VAR}",
+            "Env var should not be expanded when parsing is disabled"
+        );
+
+        assert!(!control.is_read_only());
+        assert!(
+            control.is_no_delete(),
+            "Config should be NO_DELETE due to no config_dir, not env vars"
+        );
+
+        remove_env_var("DISABLED_TEST_VAR");
+    }
+
+    /// 多实例隔离测试
+    ///
+    /// 验证：
+    /// - 不同实例可以使用不同的环境变量值
+    /// - 环境变量在运行时被解析，支持动态切换
+    #[tokio::test]
+    async fn test_multiple_instances_with_different_env_vars() {
+        // 实例1：使用第一组环境变量
+        set_env_var("INSTANCE_SECRET", "instance1-secret");
+        set_env_var("INSTANCE_NAME", "instance-one");
+
+        let mut temp_file1 = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "${INSTANCE_NAME}"
+
+[network_identity]
+network_name = "multi-test"
+network_secret = "${INSTANCE_SECRET}"
+"#;
+        temp_file1.write_all(config_content.as_bytes()).unwrap();
+        temp_file1.flush().unwrap();
+
+        let config_path1 = PathBuf::from(temp_file1.path());
+        let (config1, _) = load_config_from_file(&config_path1, None, false)
+            .await
+            .unwrap();
+
+        // 验证实例1的配置
+        assert_eq!(config1.get_inst_name(), "instance-one");
+        assert_eq!(
+            config1
+                .get_network_identity()
+                .network_secret
+                .as_ref()
+                .unwrap(),
+            "instance1-secret"
+        );
+
+        // 实例2：修改环境变量后加载同一模板
+        set_env_var("INSTANCE_SECRET", "instance2-secret");
+        set_env_var("INSTANCE_NAME", "instance-two");
+
+        let mut temp_file2 = NamedTempFile::new().unwrap();
+        temp_file2.write_all(config_content.as_bytes()).unwrap();
+        temp_file2.flush().unwrap();
+
+        let config_path2 = PathBuf::from(temp_file2.path());
+        let (config2, _) = load_config_from_file(&config_path2, None, false)
+            .await
+            .unwrap();
+
+        // 验证实例2使用了不同的环境变量值
+        assert_eq!(config2.get_inst_name(), "instance-two");
+        assert_eq!(
+            config2
+                .get_network_identity()
+                .network_secret
+                .as_ref()
+                .unwrap(),
+            "instance2-secret"
+        );
+
+        // 验证两个实例的配置确实不同
+        assert_ne!(config1.get_inst_name(), config2.get_inst_name());
+        assert_ne!(
+            config1.get_network_identity().network_secret,
+            config2.get_network_identity().network_secret
+        );
+
+        // 清理
+        remove_env_var("INSTANCE_SECRET");
+        remove_env_var("INSTANCE_NAME");
+    }
+
+    /// 实际配置字段测试（network_secret、peer.uri 等）
+    ///
+    /// 验证：
+    /// - network_secret 字段支持环境变量
+    /// - peer.uri 字段支持环境变量
+    /// - listeners 字段支持环境变量
+    /// - 其他实际使用的配置字段
+    #[tokio::test]
+    async fn test_real_config_fields_expansion() {
+        // 设置各种实际场景的环境变量
+        set_env_var("CONFIG_REAL_SECRET", "production-secret-key");
+        set_env_var("PEER_HOST", "peer.example.com");
+        set_env_var("PEER_PORT", "11011");
+        set_env_var("LISTEN_PORT", "11010");
+        set_env_var("NETWORK_NAME", "prod-network");
+
+        // 创建包含多个实际字段的完整配置
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "production"
+ipv4 = "10.144.144.1"
+listeners = ["tcp://0.0.0.0:${LISTEN_PORT}"]
+
+[network_identity]
+network_name = "${NETWORK_NAME}"
+network_secret = "${CONFIG_REAL_SECRET}"
+
+[[peer]]
+uri = "tcp://${PEER_HOST}:${PEER_PORT}"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证 network_identity 字段
+        let identity = config.get_network_identity();
+        assert_eq!(identity.network_name, "prod-network");
+        assert_eq!(
+            identity.network_secret.as_ref().unwrap(),
+            "production-secret-key"
+        );
+
+        // 验证 listeners 字段
+        let listeners = config.get_listener_uris();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].to_string(), "tcp://0.0.0.0:11010");
+
+        // 验证 peer 字段
+        let peers = config.get_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].uri.to_string(), "tcp://peer.example.com:11011");
+
+        // 验证配置被正确标记
+        assert!(control.is_read_only());
+        assert!(control.is_no_delete());
+
+        // 清理环境变量
+        remove_env_var("CONFIG_REAL_SECRET");
+        remove_env_var("PEER_HOST");
+        remove_env_var("PEER_PORT");
+        remove_env_var("LISTEN_PORT");
+        remove_env_var("NETWORK_NAME");
+    }
+
+    /// 带默认值的环境变量
+    ///
+    /// 验证：
+    /// - ${VAR:-default} 语法在变量未定义时使用默认值
+    #[tokio::test]
+    async fn test_env_var_with_default_value() {
+        // 确保变量未定义
+        remove_env_var("UNDEFINED_PORT");
+        remove_env_var("UNDEFINED_SECRET");
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "default-test"
+listeners = ["tcp://0.0.0.0:${UNDEFINED_PORT:-11010}"]
+
+[network_identity]
+network_name = "test"
+network_secret = "${UNDEFINED_SECRET:-default-secret}"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+
+        let (config, _) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证使用了默认值
+        assert_eq!(
+            config
+                .get_network_identity()
+                .network_secret
+                .as_ref()
+                .unwrap(),
+            "default-secret"
+        );
+        assert_eq!(
+            config.get_listener_uris()[0].to_string(),
+            "tcp://0.0.0.0:11010"
+        );
+    }
+
+    /// 环境变量未定义且无默认值的情况
+    ///
+    /// 验证：
+    /// - 未定义的环境变量保持原样（shellexpand 的默认行为）
+    #[tokio::test]
+    async fn test_undefined_env_var_without_default() {
+        remove_env_var("COMPLETELY_UNDEFINED");
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "undefined-test"
+
+[network_identity]
+network_name = "test"
+network_secret = "${COMPLETELY_UNDEFINED}"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证变量保持原样
+        assert_eq!(
+            config
+                .get_network_identity()
+                .network_secret
+                .as_ref()
+                .unwrap(),
+            "${COMPLETELY_UNDEFINED}"
+        );
+
+        assert!(!control.is_read_only());
+        assert!(control.is_no_delete());
+    }
+
+    /// 布尔类型环境变量
+    ///
+    /// 验证：
+    /// - 布尔类型的环境变量能正确解析和反序列化
+    /// - TOML 解析器能将字符串 "true"/"false" 转换为布尔值
+    #[tokio::test]
+    async fn test_boolean_type_env_vars() {
+        // 设置布尔类型的环境变量
+        set_env_var("ENABLE_DHCP", "true");
+        set_env_var("ENABLE_ENCRYPTION", "false");
+        set_env_var("ENABLE_IPV6", "true");
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "bool-test"
+dhcp = ${ENABLE_DHCP}
+
+[network_identity]
+network_name = "test"
+network_secret = "secret"
+
+[flags]
+enable_encryption = ${ENABLE_ENCRYPTION}
+enable_ipv6 = ${ENABLE_IPV6}
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证布尔值被正确解析
+        assert!(config.get_dhcp(), "dhcp should be true");
+
+        let flags = config.get_flags();
+        assert!(
+            !flags.enable_encryption,
+            "enable_encryption should be false"
+        );
+        assert!(flags.enable_ipv6, "enable_ipv6 should be true");
+
+        // 验证使用环境变量的配置被标记为只读
+        assert!(control.is_read_only());
+        assert!(control.is_no_delete());
+
+        // 清理
+        remove_env_var("ENABLE_DHCP");
+        remove_env_var("ENABLE_ENCRYPTION");
+        remove_env_var("ENABLE_IPV6");
+    }
+
+    /// 数字类型环境变量
+    ///
+    /// 验证：
+    /// - 数字类型（整数、端口号）的环境变量能正确解析和反序列化
+    /// - TOML 解析器能将字符串 "1380" 转换为整数
+    #[tokio::test]
+    async fn test_numeric_type_env_vars() {
+        // 设置数字类型的环境变量
+        set_env_var("MTU_VALUE", "1400");
+        set_env_var("THREAD_COUNT", "4");
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "numeric-test"
+
+[network_identity]
+network_name = "test"
+network_secret = "secret"
+
+[flags]
+mtu = ${MTU_VALUE}
+multi_thread_count = ${THREAD_COUNT}
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证数字值被正确解析
+        let flags = config.get_flags();
+        assert_eq!(flags.mtu, 1400, "mtu should be 1400");
+        assert_eq!(
+            flags.multi_thread_count, 4,
+            "multi_thread_count should be 4"
+        );
+
+        // 验证使用环境变量的配置被标记为只读
+        assert!(control.is_read_only());
+        assert!(control.is_no_delete());
+
+        // 清理
+        remove_env_var("MTU_VALUE");
+        remove_env_var("THREAD_COUNT");
+    }
+
+    /// 混合类型环境变量
+    ///
+    /// 验证：
+    /// - 字符串、布尔、数字类型的环境变量可以同时使用
+    /// - 所有类型都能正确解析和反序列化
+    /// - 模拟真实的复杂配置场景
+    #[tokio::test]
+    async fn test_mixed_type_env_vars() {
+        // 设置不同类型的环境变量
+        set_env_var("MIXED_SECRET", "mixed-secret-key");
+        set_env_var("MIXED_NETWORK", "production");
+        set_env_var("MIXED_DHCP", "true");
+        set_env_var("MIXED_MTU", "1500");
+        set_env_var("MIXED_ENCRYPTION", "false");
+        set_env_var("MIXED_LISTEN_PORT", "12345");
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+instance_name = "mixed-test"
+ipv4 = "10.0.0.1"
+dhcp = ${MIXED_DHCP}
+listeners = ["tcp://0.0.0.0:${MIXED_LISTEN_PORT}"]
+
+[network_identity]
+network_name = "${MIXED_NETWORK}"
+network_secret = "${MIXED_SECRET}"
+
+[flags]
+mtu = ${MIXED_MTU}
+enable_encryption = ${MIXED_ENCRYPTION}
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config_path = PathBuf::from(temp_file.path());
+        let (config, control) = load_config_from_file(&config_path, None, false)
+            .await
+            .unwrap();
+
+        // 验证字符串类型
+        let identity = config.get_network_identity();
+        assert_eq!(identity.network_name, "production");
+        assert_eq!(
+            identity.network_secret.as_ref().unwrap(),
+            "mixed-secret-key"
+        );
+
+        // 验证布尔类型
+        assert!(config.get_dhcp());
+
+        let flags = config.get_flags();
+        assert!(!flags.enable_encryption);
+
+        // 验证数字类型
+        assert_eq!(flags.mtu, 1500);
+
+        // 验证 URL 中的端口号（数字）
+        let listeners = config.get_listener_uris();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].to_string(), "tcp://0.0.0.0:12345");
+
+        // 验证配置被标记为只读
+        assert!(control.is_read_only());
+        assert!(control.is_no_delete());
+
+        // 清理
+        remove_env_var("MIXED_SECRET");
+        remove_env_var("MIXED_NETWORK");
+        remove_env_var("MIXED_DHCP");
+        remove_env_var("MIXED_MTU");
+        remove_env_var("MIXED_ENCRYPTION");
+        remove_env_var("MIXED_LISTEN_PORT");
     }
 }

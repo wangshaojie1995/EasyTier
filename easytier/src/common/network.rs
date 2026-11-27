@@ -1,29 +1,133 @@
-use std::{net::IpAddr, ops::Deref, sync::Arc};
+#[cfg(not(mobile))]
+use std::collections::HashMap;
+use std::net::IpAddr;
+#[cfg(any(target_os = "windows", test))]
+use std::sync::{Arc, RwLock};
+#[cfg(any(target_os = "windows", test))]
+use std::time::{Duration, Instant};
 
-use pnet::datalink::NetworkInterface;
-use tokio::{
-    sync::{Mutex, RwLock},
-    task::JoinSet,
-};
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+use tokio::sync::Mutex;
 
 use crate::proto::peer_rpc::GetIpListResponse;
 
-use super::{netns::NetNS, stun::StunInfoCollectorTrait};
+use super::netns::NetNS;
 
-pub const CACHED_IP_LIST_TIMEOUT_SEC: u64 = 60;
-
-struct InterfaceFilter {
-    iface: NetworkInterface,
+#[cfg(not(mobile))]
+#[derive(Clone, Copy, Debug, Default)]
+struct InterfaceState {
+    is_point_to_point: bool,
+    is_loopback: bool,
+    is_up: bool,
+    #[cfg(target_os = "linux")]
+    is_lower_up: bool,
 }
 
-#[cfg(target_os = "android")]
-impl InterfaceFilter {
-    async fn filter_iface(&self) -> bool {
-        true
+#[cfg(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    all(target_os = "macos", not(feature = "macos-ne")),
+    target_os = "freebsd"
+))]
+fn collect_interface_states() -> HashMap<String, InterfaceState> {
+    let mut states = HashMap::new();
+    if let Ok(interfaces) = nix::ifaddrs::getifaddrs() {
+        use nix::net::if_::InterfaceFlags;
+
+        for interface in interfaces {
+            let flags = interface.flags;
+            #[cfg(target_os = "linux")]
+            let is_lower_up = flags.contains(InterfaceFlags::IFF_LOWER_UP);
+            states.insert(
+                interface.interface_name,
+                InterfaceState {
+                    is_point_to_point: flags.contains(InterfaceFlags::IFF_POINTOPOINT),
+                    is_loopback: flags.contains(InterfaceFlags::IFF_LOOPBACK),
+                    is_up: flags.contains(InterfaceFlags::IFF_UP),
+                    #[cfg(target_os = "linux")]
+                    is_lower_up,
+                },
+            );
+        }
+    }
+    states
+}
+
+#[cfg(not(mobile))]
+#[cfg(not(any(
+    all(target_os = "linux", not(target_env = "ohos")),
+    all(target_os = "macos", not(feature = "macos-ne")),
+    target_os = "freebsd"
+)))]
+fn collect_interface_states() -> HashMap<String, InterfaceState> {
+    HashMap::new()
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "windows"))]
+fn has_nonzero_mac(iface: &NetworkInterface) -> bool {
+    iface.mac_addr.as_deref().is_some_and(|mac| {
+        let mut octets = mac.split([':', '-']);
+        let mut nonzero = false;
+        for _ in 0..6 {
+            let Some(value) = octets
+                .next()
+                .and_then(|octet| u8::from_str_radix(octet, 16).ok())
+            else {
+                return false;
+            };
+            nonzero |= value != 0;
+        }
+        octets.next().is_none() && nonzero
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn ip_mask_to_prefix(mask: IpAddr) -> Result<u8, ()> {
+    match mask {
+        IpAddr::V4(mask) => {
+            let raw = u32::from(mask);
+            let prefix = raw.leading_ones() as u8;
+            let expected = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (raw == expected).then_some(prefix).ok_or(())
+        }
+        IpAddr::V6(mask) => {
+            let raw = u128::from(mask);
+            let prefix = raw.leading_ones() as u8;
+            let expected = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (raw == expected).then_some(prefix).ok_or(())
+        }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(mobile))]
+struct InterfaceFilter {
+    iface: NetworkInterface,
+    state: InterfaceState,
+}
+
+#[cfg(not(mobile))]
+fn interface_state(
+    iface: &NetworkInterface,
+    states: &HashMap<String, InterfaceState>,
+) -> InterfaceState {
+    states.get(&iface.name).copied().unwrap_or(InterfaceState {
+        is_loopback: iface.internal,
+        is_up: true,
+        #[cfg(target_os = "linux")]
+        is_lower_up: true,
+        ..Default::default()
+    })
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl InterfaceFilter {
     async fn is_tun_tap_device(&self) -> bool {
         let path = format!("/sys/class/net/{}/tun_flags", self.iface.name);
@@ -32,7 +136,7 @@ impl InterfaceFilter {
 
     async fn has_valid_ip(&self) -> bool {
         self.iface
-            .ips
+            .addr
             .iter()
             .map(|ip| ip.ip())
             .any(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
@@ -42,35 +146,72 @@ impl InterfaceFilter {
         tracing::trace!(
             "filter linux iface: {:?}, is_point_to_point: {}, is_loopback: {}, is_up: {}, is_lower_up: {}, is_tun: {}, has_valid_ip: {}",
             self.iface,
-            self.iface.is_point_to_point(),
-            self.iface.is_loopback(),
-            self.iface.is_up(),
-            self.iface.is_lower_up(),
+            self.state.is_point_to_point,
+            self.state.is_loopback,
+            self.state.is_up,
+            self.state.is_lower_up,
             self.is_tun_tap_device().await,
             self.has_valid_ip().await
         );
 
-        !self.iface.is_point_to_point()
-            && !self.iface.is_loopback()
-            && self.iface.is_up()
-            && self.iface.is_lower_up()
+        !self.state.is_point_to_point
+            && !self.state.is_loopback
+            && self.state.is_up
+            && self.state.is_lower_up
             && !self.is_tun_tap_device().await
             && self.has_valid_ip().await
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+// Cache for networksetup command output
+#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+static NETWORKSETUP_CACHE: std::sync::OnceLock<Mutex<(String, std::time::Instant)>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(
+    all(target_os = "macos", not(feature = "macos-ne")),
+    target_os = "freebsd"
+))]
 impl InterfaceFilter {
-    #[cfg(target_os = "macos")]
-    async fn is_interface_physical(&self) -> bool {
-        let interface_name = &self.iface.name;
-        let output = tokio::process::Command::new("networksetup")
-            .args(&["-listallhardwareports"])
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    async fn get_networksetup_output() -> String {
+        use anyhow::Context;
+        use std::time::{Duration, Instant};
+        let cache = NETWORKSETUP_CACHE.get_or_init(|| Mutex::new((String::new(), Instant::now())));
+        let mut cache_guard = cache.lock().await;
+
+        // Check if cache is still valid (less than 1 minute old)
+        if cache_guard.1.elapsed() < Duration::from_secs(60) && !cache_guard.0.is_empty() {
+            return cache_guard.0.clone();
+        }
+
+        // Cache is expired or empty, fetch new data
+        let stdout = tokio::process::Command::new("networksetup")
+            .args(["-listallhardwareports"])
             .output()
             .await
-            .expect("Failed to execute command");
+            .with_context(|| "Failed to execute networksetup command")
+            .and_then(|output| {
+                std::str::from_utf8(&output.stdout)
+                    .map(|s| s.to_string())
+                    .with_context(|| "Failed to convert networksetup output to string")
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to execute networksetup command: {:?}", e);
+                String::new()
+            });
 
-        let stdout = std::str::from_utf8(&output.stdout).expect("Invalid UTF-8");
+        // Update cache
+        cache_guard.0 = stdout.clone();
+        cache_guard.1 = Instant::now();
+
+        stdout
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
+    async fn is_interface_physical(&self) -> bool {
+        let interface_name = &self.iface.name;
+        let stdout = Self::get_networksetup_output().await;
 
         let lines: Vec<&str> = stdout.lines().collect();
 
@@ -79,11 +220,7 @@ impl InterfaceFilter {
 
             if line.contains("Device:") && line.contains(interface_name) {
                 let next_line = lines[i + 1];
-                if next_line.contains("Virtual Interface") {
-                    return false;
-                } else {
-                    return true;
-                }
+                return !next_line.contains("Virtual Interface");
             }
         }
 
@@ -93,13 +230,13 @@ impl InterfaceFilter {
     #[cfg(target_os = "freebsd")]
     async fn is_interface_physical(&self) -> bool {
         // if mac addr is not zero, then it's physical interface
-        self.iface.mac.map(|mac| !mac.is_zero()).unwrap_or(false)
+        has_nonzero_mac(&self.iface)
     }
 
     async fn filter_iface(&self) -> bool {
-        !self.iface.is_point_to_point()
-            && !self.iface.is_loopback()
-            && self.iface.is_up()
+        !self.state.is_point_to_point
+            && !self.state.is_loopback
+            && self.state.is_up
             && self.is_interface_physical().await
     }
 }
@@ -110,19 +247,19 @@ impl InterfaceFilter {
         tracing::debug!(
             "iface_name: {:?}, p2p: {:?}, is_up: {:?}, iface: {:?}",
             self.iface.name,
-            self.iface.is_point_to_point(),
-            self.iface.is_up(),
+            self.state.is_point_to_point,
+            self.state.is_up,
             self.iface
         );
-        !self.iface.is_point_to_point()
-            && !self.iface.is_loopback()
+        !self.state.is_point_to_point
+            && !self.state.is_loopback
             && self
                 .iface
-                .ips
+                .addr
                 .iter()
                 .map(|ip| ip.ip())
                 .any(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast())
-            && self.iface.mac.map(|mac| !mac.is_zero()).unwrap_or(false)
+            && has_nonzero_mac(&self.iface)
     }
 }
 
@@ -154,82 +291,135 @@ pub async fn local_ipv6() -> std::io::Result<std::net::Ipv6Addr> {
     }
 }
 
-pub struct IPCollector {
-    cached_ip_list: Arc<RwLock<GetIpListResponse>>,
-    collect_ip_task: Mutex<JoinSet<()>>,
-    net_ns: NetNS,
-    stun_info_collector: Arc<Box<dyn StunInfoCollectorTrait>>,
+pub(crate) async fn collect_interfaces(net_ns: NetNS, filter: bool) -> Vec<NetworkInterface> {
+    #[cfg(target_os = "linux")]
+    {
+        run_in_namespace(net_ns, move || async move {
+            collect_interfaces_in_current_namespace(filter).await
+        })
+        .await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _g = net_ns.guard();
+        collect_interfaces_in_current_namespace(filter).await
+    }
 }
 
-impl IPCollector {
-    pub fn new<T: StunInfoCollectorTrait + 'static>(net_ns: NetNS, stun_info_collector: T) -> Self {
-        Self {
-            cached_ip_list: Arc::new(RwLock::new(GetIpListResponse::default())),
-            collect_ip_task: Mutex::new(JoinSet::new()),
-            net_ns,
-            stun_info_collector: Arc::new(Box::new(stun_info_collector)),
-        }
+/// The Windows bind path resolves an interface name and then its index
+/// through full `NetworkInterface::show()` enumerations for every bind
+/// candidate. With 10+ adapters (VMware / Hyper-V / APIPA leftovers are
+/// common), one connect round turns into O(candidates) synchronous
+/// enumerations on the async worker. Interfaces rarely change within a
+/// connect round, so snapshots are reused for a short TTL.
+/// Only use this cache for socket binding; interface configuration needs
+/// fresh enumeration to observe adapter creation and replacement immediately.
+#[cfg(target_os = "windows")]
+pub(crate) fn get_interfaces_cached() -> Option<Arc<Vec<NetworkInterface>>> {
+    static SNAPSHOT: InterfaceSnapshot = RwLock::new(None);
+    get_or_refresh_interfaces(&SNAPSHOT, || NetworkInterface::show().ok())
+}
+
+#[cfg(any(target_os = "windows", test))]
+type InterfaceSnapshot = RwLock<Option<(Instant, Arc<Vec<NetworkInterface>>)>>;
+
+#[cfg(any(target_os = "windows", test))]
+fn get_or_refresh_interfaces(
+    snapshot: &InterfaceSnapshot,
+    enumerate: impl FnOnce() -> Option<Vec<NetworkInterface>>,
+) -> Option<Arc<Vec<NetworkInterface>>> {
+    const SNAPSHOT_TTL: Duration = Duration::from_secs(1);
+    if let Some((at, ifaces)) = snapshot.read().ok().and_then(|guard| guard.clone())
+        && at.elapsed() < SNAPSHOT_TTL
+    {
+        return Some(ifaces);
     }
 
-    pub async fn collect_ip_addrs(&self) -> GetIpListResponse {
-        let mut task = self.collect_ip_task.lock().await;
-        if task.is_empty() {
-            let cached_ip_list = self.cached_ip_list.clone();
-            *cached_ip_list.write().await =
-                Self::do_collect_local_ip_addrs(self.net_ns.clone()).await;
-            let net_ns = self.net_ns.clone();
-            let stun_info_collector = self.stun_info_collector.clone();
-            task.spawn(async move {
-                loop {
-                    let ip_addrs = Self::do_collect_local_ip_addrs(net_ns.clone()).await;
-                    *cached_ip_list.write().await = ip_addrs;
-                    tokio::time::sleep(std::time::Duration::from_secs(CACHED_IP_LIST_TIMEOUT_SEC))
-                        .await;
-                }
-            });
+    // Recheck after acquiring the write lock: another caller may have refreshed
+    // while we waited. Keep the lock during enumeration to coalesce refreshes.
+    let mut snapshot = snapshot.write().ok()?;
+    if let Some((at, ifaces)) = snapshot.as_ref()
+        && at.elapsed() < SNAPSHOT_TTL
+    {
+        return Some(ifaces.clone());
+    }
+    let ifaces = Arc::new(enumerate()?);
+    *snapshot = Some((Instant::now(), ifaces.clone()));
+    Some(ifaces)
+}
 
-            let cached_ip_list = self.cached_ip_list.clone();
-            task.spawn(async move {
-                loop {
-                    let stun_info = stun_info_collector.get_stun_info();
-                    for ip in stun_info.public_ip.iter() {
-                        let Ok(ip_addr) = ip.parse::<IpAddr>() else {
-                            continue;
-                        };
+#[cfg(feature = "faketcp")]
+fn convert_pnet_interface(iface: pnet_datalink::NetworkInterface) -> NetworkInterface {
+    let internal = iface.is_loopback();
+    let addr = iface
+        .ips
+        .into_iter()
+        .filter_map(|network| match (network.ip(), network.mask()) {
+            (IpAddr::V4(ip), IpAddr::V4(netmask)) => {
+                Some(network_interface::Addr::V4(network_interface::V4IfAddr {
+                    ip,
+                    broadcast: None,
+                    netmask: Some(netmask),
+                }))
+            }
+            (IpAddr::V6(ip), IpAddr::V6(netmask)) => {
+                Some(network_interface::Addr::V6(network_interface::V6IfAddr {
+                    ip,
+                    broadcast: None,
+                    netmask: Some(netmask),
+                }))
+            }
+            _ => None,
+        })
+        .collect();
+    NetworkInterface {
+        name: iface.name,
+        addr,
+        mac_addr: iface.mac.map(|mac| mac.to_string()),
+        index: iface.index,
+        internal,
+    }
+}
 
-                        match ip_addr {
-                            IpAddr::V4(v) => {
-                                cached_ip_list.write().await.public_ipv4 = Some(v.into())
-                            }
-                            IpAddr::V6(v) => {
-                                cached_ip_list.write().await.public_ipv6 = Some(v.into())
-                            }
-                        }
+async fn collect_interfaces_in_current_namespace(filter: bool) -> Vec<NetworkInterface> {
+    let ifaces = match NetworkInterface::show() {
+        Ok(ifaces) => ifaces,
+        Err(error) => {
+            tracing::warn!(?error, "failed to enumerate network interfaces");
+            #[cfg(feature = "faketcp")]
+            {
+                match std::panic::catch_unwind(pnet_datalink::interfaces) {
+                    Ok(ifaces) => ifaces.into_iter().map(convert_pnet_interface).collect(),
+                    Err(_) => {
+                        tracing::error!(
+                            "failed to enumerate network interfaces via network-interface and pnet"
+                        );
+                        return Vec::new();
                     }
-
-                    let sleep_sec = if !cached_ip_list.read().await.public_ipv4.is_none() {
-                        CACHED_IP_LIST_TIMEOUT_SEC
-                    } else {
-                        3
-                    };
-                    tokio::time::sleep(std::time::Duration::from_secs(sleep_sec)).await;
                 }
-            });
+            }
+            #[cfg(not(feature = "faketcp"))]
+            return Vec::new();
         }
-
-        return self.cached_ip_list.read().await.deref().clone();
+    };
+    #[cfg(mobile)]
+    {
+        let _ = filter;
+        ifaces
     }
 
-    pub async fn collect_interfaces(net_ns: NetNS) -> Vec<NetworkInterface> {
-        let _g = net_ns.guard();
-        let ifaces = pnet::datalink::interfaces();
+    #[cfg(not(mobile))]
+    {
+        let states = collect_interface_states();
         let mut ret = vec![];
         for iface in ifaces {
             let f = InterfaceFilter {
                 iface: iface.clone(),
+                state: interface_state(&iface, &states),
             };
 
-            if !f.filter_iface().await {
+            if filter && !f.filter_iface().await {
                 continue;
             }
 
@@ -238,44 +428,176 @@ impl IPCollector {
 
         ret
     }
+}
 
-    #[tracing::instrument(skip(net_ns))]
-    async fn do_collect_local_ip_addrs(net_ns: NetNS) -> GetIpListResponse {
-        let mut ret = GetIpListResponse::default();
+#[cfg(target_os = "linux")]
+async fn run_in_namespace<T, F, Fut>(net_ns: NetNS, operation: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build namespace-local runtime");
+        net_ns.run(|| runtime.block_on(operation()))
+    })
+    .await
+    .expect("namespace-local network operation panicked")
+}
 
-        let ifaces = Self::collect_interfaces(net_ns.clone()).await;
+#[tracing::instrument(skip(net_ns))]
+pub(crate) async fn collect_local_ip_addrs(net_ns: NetNS) -> GetIpListResponse {
+    #[cfg(target_os = "linux")]
+    {
+        return run_in_namespace(net_ns, || async {
+            collect_local_ip_addrs_in_current_namespace().await
+        })
+        .await;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
         let _g = net_ns.guard();
-        for iface in ifaces {
-            for ip in iface.ips {
-                let ip: std::net::IpAddr = ip.ip();
+        collect_local_ip_addrs_in_current_namespace().await
+    }
+}
+
+async fn collect_local_ip_addrs_in_current_namespace() -> GetIpListResponse {
+    let mut ret = GetIpListResponse::default();
+
+    let ifaces = collect_interfaces_in_current_namespace(true).await;
+    for iface in ifaces {
+        for ip in iface.addr {
+            let ip: std::net::IpAddr = ip.ip();
+            if let std::net::IpAddr::V4(v4) = ip {
                 if ip.is_loopback() || ip.is_multicast() {
                     continue;
                 }
-                match ip {
-                    std::net::IpAddr::V4(v4) => {
-                        ret.interface_ipv4s.push(v4.into());
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        ret.interface_ipv6s.push(v6.into());
-                    }
+                ret.interface_ipv4s.push(v4.into());
+            }
+        }
+    }
+
+    let ifaces = collect_interfaces_in_current_namespace(false).await;
+    for iface in ifaces {
+        for ip in iface.addr {
+            let ip: std::net::IpAddr = ip.ip();
+            if let std::net::IpAddr::V6(v6) = ip {
+                if v6.is_multicast() || v6.is_loopback() || v6.is_unicast_link_local() {
+                    continue;
                 }
+                ret.interface_ipv6s.push(v6.into());
             }
         }
+    }
 
-        if let Ok(v4_addr) = local_ipv4().await {
-            tracing::trace!("got local ipv4: {}", v4_addr);
-            if !ret.interface_ipv4s.contains(&v4_addr.into()) {
-                ret.interface_ipv4s.push(v4_addr.into());
+    if let Ok(v4_addr) = local_ipv4().await {
+        tracing::trace!("got local ipv4: {}", v4_addr);
+        if !ret.interface_ipv4s.contains(&v4_addr.into()) {
+            ret.interface_ipv4s.push(v4_addr.into());
+        }
+    }
+
+    if let Ok(v6_addr) = local_ipv6().await {
+        tracing::trace!("got local ipv6: {}", v6_addr);
+        if !ret.interface_ipv6s.contains(&v6_addr.into()) {
+            ret.interface_ipv6s.push(v6_addr.into());
+        }
+    }
+
+    ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_contiguous_ip_masks_to_prefixes() {
+        assert_eq!(
+            ip_mask_to_prefix(IpAddr::V4("255.255.254.0".parse().unwrap())),
+            Ok(23)
+        );
+        assert_eq!(
+            ip_mask_to_prefix(IpAddr::V6("ffff:ffff:ffff:ffff::".parse().unwrap())),
+            Ok(64)
+        );
+        assert_eq!(
+            ip_mask_to_prefix(IpAddr::V4("255.0.255.0".parse().unwrap())),
+            Err(())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn namespace_operation_does_not_migrate_between_os_threads() {
+        let (before, after) = run_in_namespace(NetNS::new(None), || async {
+            let before = std::thread::current().id();
+            tokio::task::yield_now().await;
+            (before, std::thread::current().id())
+        })
+        .await;
+
+        assert_eq!(before, after);
+    }
+}
+
+#[cfg(test)]
+mod interface_snapshot_tests {
+    use super::*;
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn concurrent_refreshes_share_cold_and_expired_snapshots() {
+        for initial in [
+            None,
+            Some((Instant::now() - Duration::from_secs(2), Arc::new(vec![]))),
+        ] {
+            let snapshot = InterfaceSnapshot::new(initial);
+            let calls = AtomicUsize::new(0);
+            let barrier = Barrier::new(8);
+            let results = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            get_or_refresh_interfaces(&snapshot, || {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(20));
+                                Some(vec![])
+                            })
+                            .unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            for result in &results {
+                assert!(Arc::ptr_eq(&results[0], result));
             }
         }
+    }
 
-        if let Ok(v6_addr) = local_ipv6().await {
-            tracing::trace!("got local ipv6: {}", v6_addr);
-            if !ret.interface_ipv6s.contains(&v6_addr.into()) {
-                ret.interface_ipv6s.push(v6_addr.into());
-            }
-        }
-
-        ret
+    #[test]
+    fn failed_refresh_is_retried_without_serving_expired_snapshot() {
+        let snapshot = InterfaceSnapshot::new(Some((
+            Instant::now() - Duration::from_secs(2),
+            Arc::new(vec![]),
+        )));
+        assert!(get_or_refresh_interfaces(&snapshot, || None).is_none());
+        let refreshed = get_or_refresh_interfaces(&snapshot, || Some(vec![])).unwrap();
+        let cached =
+            get_or_refresh_interfaces(&snapshot, || panic!("cache should be fresh")).unwrap();
+        assert!(Arc::ptr_eq(&refreshed, &cached));
     }
 }

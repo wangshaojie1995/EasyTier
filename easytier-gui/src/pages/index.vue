@@ -1,217 +1,482 @@
 <script setup lang="ts">
-import { appLogDir } from '@tauri-apps/api/path'
 
-import { getCurrentWindow } from '@tauri-apps/api/window'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { type } from '@tauri-apps/plugin-os'
-import { exit } from '@tauri-apps/plugin-process'
-import { open } from '@tauri-apps/plugin-shell'
-import TieredMenu from 'primevue/tieredmenu'
-import { useToast } from 'primevue/usetoast'
-import { NetworkTypes, Config, Status, Utils, I18nUtils } from 'easytier-frontend-lib'
 
-import { isAutostart, setLoggingLevel } from '~/composables/network'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { open } from '@tauri-apps/plugin-shell'
+import { exit } from '@tauri-apps/plugin-process'
+import { I18nUtils, RemoteManagement, Utils } from "easytier-frontend-lib"
+import type { MenuItem } from 'primevue/menuitem'
 import { useTray } from '~/composables/tray'
-import { getAutoLaunchStatusAsync as getAutoLaunchStatus, loadAutoLaunchStatusAsync } from '~/modules/auto_launch'
+import {
+  consumePendingMobileVpnTileAction,
+  initMobileVpnService,
+  setMobileVpnTileActionHandler,
+  setMobileVpnErrorHandler,
+  syncMobileVpnService,
+} from '~/composables/mobile_vpn'
+import { executeVpnTileAction } from '~/composables/mobile_vpn_tile'
+import { bootstrapAndroidManagement } from '~/composables/android_management'
+import { GUIRemoteClient } from '~/modules/api'
+
+import { useToast, useConfirm } from 'primevue'
+import { loadMode, saveMode, WebClientConfig, type Mode } from '~/composables/mode'
+import {
+  saveLastNetworkInstanceId,
+  loadLastNetworkInstanceId,
+  loadVpnTileStoppedInstanceIds,
+  saveVpnTileStoppedInstanceIds,
+} from '~/composables/config'
+import ModeSwitcher from '~/components/ModeSwitcher.vue'
+import { getEasytierVersion, getServiceStatus, getManagementStatus } from '~/composables/backend'
+import { managementWarningDetails, type OperationOutcome } from '~/composables/management_status'
 
 const { t, locale } = useI18n()
-const visible = ref(false)
+const confirm = useConfirm()
 const aboutVisible = ref(false)
-const tomlConfig = ref('')
+const modeDialogVisible = ref(false)
+const currentMode = ref<Mode>({ mode: 'normal' })
+const editingMode = ref<Mode>({ mode: 'normal' })
+const isModeSaving = ref(false)
+const manualDisconnect = ref(false)
+const managementReady = ref(type() !== 'android')
+
+const configServerDialogVisible = ref(false)
+const configServerConnected = ref(false)
+
+const showAutostartHint = ref(false)
+
+async function openModeDialog() {
+  editingMode.value = JSON.parse(JSON.stringify(currentMode.value))
+  showAutostartHint.value = false
+  modeDialogVisible.value = true
+}
+
+async function openAutostartDialog() {
+  editingMode.value = JSON.parse(JSON.stringify(currentMode.value))
+  editingMode.value.mode = 'service'
+  showAutostartHint.value = true
+  modeDialogVisible.value = true
+}
+
+async function onModeSave() {
+  if (isModeSaving.value) {
+    return;
+  }
+  isModeSaving.value = true
+  try {
+    await initWithMode(editingMode.value);
+    modeDialogVisible.value = false
+  }
+  catch (e: any) {
+    toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+    console.error("Error switching mode", e, currentMode.value, editingMode.value)
+    await initWithMode(currentMode.value);
+  }
+  finally {
+    isModeSaving.value = false
+  }
+}
+
+async function onUninstallService() {
+  confirm.require({
+    message: t('mode.uninstall_service_confirm'),
+    header: t('mode.uninstall_service'),
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: {
+      label: t('web.common.cancel'),
+      severity: 'secondary',
+      outlined: true
+    },
+    acceptProps: {
+      label: t('mode.uninstall_service'),
+      severity: 'danger'
+    },
+    accept: async () => {
+      isModeSaving.value = true
+      try {
+        await initWithMode({ ...currentMode.value, mode: 'normal' });
+        await initService(undefined)
+        toast.add({ severity: 'success', summary: t('web.common.success'), detail: t('mode.uninstall_service_success'), life: 3000 })
+        modeDialogVisible.value = false
+      } catch (e: any) {
+        toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+        console.error("Error uninstalling service", e)
+      } finally {
+        isModeSaving.value = false
+      }
+    },
+  });
+}
+
+function stripModeMetadata(mode: Mode) {
+  if (mode.mode !== 'service') {
+    return mode
+  }
+
+  const serviceConfig = { ...mode }
+  delete serviceConfig.installed_core_version
+  return serviceConfig
+}
+
+function modeConfigChanged(next: Mode) {
+  return JSON.stringify(stripModeMetadata(next)) !== JSON.stringify(stripModeMetadata(currentMode.value))
+}
+
+async function onStopService() {
+  isModeSaving.value = true
+  manualDisconnect.value = true
+  try {
+    await setServiceStatus(false)
+    toast.add({ severity: 'success', summary: t('web.common.success'), detail: t('mode.stop_service_success'), life: 3000 })
+    modeDialogVisible.value = false
+  }
+  catch (e: any) {
+    toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+    console.error("Error stopping service", e)
+  }
+  finally {
+    isModeSaving.value = false
+  }
+}
+
+async function initWithMode(mode: Mode) {
+  const running_inst_ids = (await remoteClient.value.list_network_instance_ids().catch(() => undefined))?.running_inst_ids ?? []
+
+  if (currentMode.value.mode === 'service' && mode.mode !== 'service') {
+    let serviceStatus = await getServiceStatus()
+    if (serviceStatus === "Running") {
+      manualDisconnect.value = true
+      await setServiceStatus(false)
+      serviceStatus = await getServiceStatus()
+      for (let i = 0; i < 10; i++) { // macOS takes a while to stop the service
+        if (serviceStatus === "Stopped") {
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100))
+        serviceStatus = await getServiceStatus()
+      }
+    }
+    if (serviceStatus === "Stopped") {
+      await initService(undefined)
+    }
+  }
+
+  let url: string | undefined = undefined
+  let retrys = 1
+  switch (mode.mode) {
+    case 'remote':
+      if (!mode.remote_rpc_address) {
+        toast.add({ severity: 'error', summary: t('error'), detail: t('mode.remote_rpc_address_empty'), life: 10000 })
+        return initWithMode({ ...mode, mode: 'normal' });
+      }
+      url = mode.remote_rpc_address
+      break;
+    case 'service': {
+      if (!mode.config_dir || !mode.file_log_dir || !mode.file_log_level || !mode.rpc_portal) {
+        toast.add({ severity: 'error', summary: t('error'), detail: t('mode.service_config_empty'), life: 10000 })
+        return initWithMode({ ...mode, mode: 'normal' });
+      }
+      let serviceStatus = await getServiceStatus()
+      const coreVersion = await getEasytierVersion()
+      if (serviceStatus === "NotInstalled" || modeConfigChanged(mode) || mode.installed_core_version !== coreVersion) {
+        mode.config_server_url = mode.config_server_url || undefined
+        await initService({
+          config_dir: mode.config_dir,
+          file_log_dir: mode.file_log_dir,
+          file_log_level: mode.file_log_level,
+          rpc_portal: mode.rpc_portal,
+          config_server: mode.config_server_url,
+        })
+        mode.installed_core_version = coreVersion
+        serviceStatus = await getServiceStatus()
+      }
+      if (serviceStatus === "Stopped") {
+        await setServiceStatus(true)
+      }
+      url = "tcp://" + mode.rpc_portal.replace("0.0.0.0", "127.0.0.1")
+      retrys = 5
+      break;
+    }
+    case 'normal':
+      url = mode.rpc_portal;
+      break;
+  }
+  for (let i = 0; i < retrys; i++) {
+    try {
+      await connectRpcClient(mode.mode === 'normal', url)
+      break;
+    } catch (e) {
+      if (i === retrys - 1) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        toast.add({
+          severity: 'error',
+          summary: t('error'),
+          detail: t('mode.rpc_connection_failed', { error: errMsg }),
+          life: 1000,
+        })
+        throw e;
+      }
+      console.error("Error connecting rpc client, retrying...", e)
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+  }
+  await sendConfigs(running_inst_ids.map(Utils.UuidToStr))
+  if (mode.mode === 'normal') {
+    mode.config_server_url = mode.config_server_url || undefined
+    initWebClient(mode.config_server_url)
+  }
+  currentMode.value = mode
+  try {
+    await saveMode(mode)
+  } catch (error) {
+    if (type() !== 'android') {
+      throw error
+    }
+    // The mode is already applied; a preference write must not abort VPN setup.
+    reportManagementWarning({ runtime_applied: true, persistence_warning: String(error) })
+  }
+  clientRunning.value = await isClientRunning()
+}
+
+onMounted(async () => {
+  const cleanupFns: Array<() => void> = []
+
+  if (type() === 'android') {
+    setMobileVpnErrorHandler(error => toast.add({ severity: 'error', summary: t('error'), detail: error, life: 10000 }))
+    cleanupFns.push(() => setMobileVpnErrorHandler())
+    try {
+      await bootstrapAndroidManagement()
+      managementReady.value = true
+    } catch (error) {
+      toast.add({ severity: 'error', summary: t('error'), detail: String(error), life: 10000 })
+      return
+    }
+    try {
+      await initMobileVpnService()
+    } catch (e: any) {
+      console.error("easytier init vpn service failed", e)
+    }
+  }
+
+  cleanupFns.push(await listenGlobalEvents())
+  cleanupFns.push(await listen<OperationOutcome>('management_warning', event => reportManagementWarning(event.payload)))
+  currentMode.value = loadMode()
+  try {
+    await initWithMode(currentMode.value);
+  } catch (error) {
+    toast.add({ severity: 'error', summary: t('error'), detail: String(error), life: 10000 })
+    return
+  }
+
+  if (type() === 'android') {
+    setMobileVpnTileActionHandler(handleMobileVpnTileAction)
+    cleanupFns.push(() => setMobileVpnTileActionHandler())
+    try {
+      await consumePendingMobileVpnTileAction()
+      await syncMobileVpnService()
+    } catch (e: any) {
+      console.error("easytier sync vpn service failed", e)
+    }
+  }
+
+  onUnmounted(() => {
+    cleanupFns.forEach(unlisten => unlisten())
+  })
+});
 
 useTray(true)
-
-const items = ref([
-  {
-    label: () => t('show_config'),
-    icon: 'pi pi-file-edit',
-    command: async () => {
-      try {
-        const ret = await parseNetworkConfig(networkStore.curNetwork)
-        tomlConfig.value = ret
-      }
-      catch (e: any) {
-        tomlConfig.value = e
-      }
-      visible.value = true
-    },
-  },
-  {
-    label: () => t('del_cur_network'),
-    icon: 'pi pi-times',
-    command: async () => {
-      networkStore.removeNetworkInstance(networkStore.curNetwork.instance_id)
-      await retainNetworkInstance(networkStore.networkInstanceIds)
-      networkStore.delCurNetwork()
-    },
-    disabled: () => networkStore.networkList.length <= 1,
-  },
-])
-
-enum Severity {
-  None = 'none',
-  Success = 'success',
-  Info = 'info',
-  Warn = 'warn',
-  Error = 'error',
+let toast = useToast();
+let lastManagementWarning = ''
+function reportManagementWarning(outcome: OperationOutcome) {
+  const detail = managementWarningDetails(outcome, key => t(key))
+  if (detail && detail !== lastManagementWarning) {
+    toast.add({ severity: 'warn', summary: t('management_warning'), detail, life: 10000 })
+  }
+  lastManagementWarning = detail
 }
 
-const messageBarSeverity = ref(Severity.None)
-const messageBarContent = ref('')
-const toast = useToast()
+const remoteClient = computed(() => new GUIRemoteClient());
+const instanceId = ref<string | undefined>(undefined);
+const clientRunning = ref(false);
 
-const networkStore = useNetworkStore()
-
-const curNetworkConfig = computed(() => {
-  if (networkStore.curNetworkId) {
-    // console.log('instanceId', props.instanceId)
-    const c = networkStore.networkList.find(n => n.instance_id === networkStore.curNetworkId)
-    if (c !== undefined)
-      return c
-  }
-
-  return networkStore.curNetwork
-})
-
-const curNetworkInst = computed<NetworkTypes.NetworkInstance | null>(() => {
-  let ret = networkStore.networkInstances.find(n => n.instance_id === curNetworkConfig.value.instance_id)
-  console.log('curNetworkInst', ret)
-  if (ret === undefined) {
-    return null;
-  } else {
-    return ret;
-  }
-})
-
-function addNewNetwork() {
-  networkStore.addNewNetwork()
-  networkStore.curNetwork = networkStore.lastNetwork
-}
-
-networkStore.$subscribe(async () => {
-  networkStore.saveToLocalStorage()
+async function handleMobileVpnTileAction(action: 'start' | 'stop') {
   try {
-    await parseNetworkConfig(networkStore.curNetwork)
-    messageBarSeverity.value = Severity.None
+    const result = await executeVpnTileAction(action, remoteClient.value, {
+      lastInstanceId: loadLastNetworkInstanceId(),
+      stoppedInstanceIds: loadVpnTileStoppedInstanceIds(),
+      saveStoppedInstanceIds: saveVpnTileStoppedInstanceIds,
+      syncVpnService: syncMobileVpnService,
+    })
+
+    if (!result.instanceId) {
+      toast.add({
+        severity: 'warn',
+        summary: t('vpn_tile_no_network'),
+        detail: t('vpn_tile_no_network_description'),
+        life: 5000,
+      })
+      return
+    }
+
+    instanceId.value = result.instanceId
+    await saveLastNetworkInstanceId(result.instanceId)
+    toast.add({
+      severity: action === 'start' ? 'success' : 'secondary',
+      summary: t(action === 'start' ? 'vpn_tile_started' : 'vpn_tile_stopped'),
+      life: 3000,
+    })
   }
-  catch (e: any) {
-    messageBarContent.value = e
-    messageBarSeverity.value = Severity.Error
+  catch (error) {
+    console.error('VPN tile action failed', action, error)
+    toast.add({
+      severity: 'error',
+      summary: t('error'),
+      detail: t('vpn_tile_action_failed', { error: String(error) }),
+      life: 8000,
+    })
+  }
+}
+
+watch(instanceId, async (newVal) => {
+  if (newVal) {
+    try {
+      await saveLastNetworkInstanceId(newVal);
+    } catch (error) {
+      toast.add({ severity: 'error', summary: t('error'), detail: String(error), life: 8000 })
+    }
+  }
+});
+
+watch(clientRunning, async (newVal, oldVal) => {
+  if (!managementReady.value) return
+  if (!newVal && oldVal) {
+    if (manualDisconnect.value) {
+      manualDisconnect.value = false
+      return
+    }
+    await reconnectClient()
+  } else if (newVal && !oldVal) {
+    const lastInstanceId = loadLastNetworkInstanceId();
+    if (lastInstanceId) {
+      instanceId.value = lastInstanceId;
+    }
   }
 })
 
-async function runNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
-  if (type() === 'android') {
-    await prepareVpnService()
-    networkStore.clearNetworkInstances()
-  }
-  else {
-    networkStore.removeNetworkInstance(cfg.instance_id)
-  }
-
-  await retainNetworkInstance(networkStore.networkInstanceIds)
-  networkStore.addNetworkInstance(cfg.instance_id)
-
-  try {
-    await runNetworkInstance(cfg)
-    networkStore.addAutoStartInstId(cfg.instance_id)
-  }
-  catch (e: any) {
-    // console.error(e)
-    toast.add({ severity: 'info', detail: e })
-  }
-
-  cb()
-}
-
-async function stopNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
-  // console.log('stopNetworkCb', cfg, cb)
-  cb()
-  networkStore.removeNetworkInstance(cfg.instance_id)
-  await retainNetworkInstance(networkStore.networkInstanceIds)
-  networkStore.removeAutoStartInstId(cfg.instance_id)
-}
-
-async function updateNetworkInfos() {
-  networkStore.updateWithNetworkInfos(await collectNetworkInfos())
-}
-
-let intervalId = 0
 onMounted(async () => {
-  intervalId = window.setInterval(async () => {
-    await updateNetworkInfos()
-  }, 500)
-
-  window.setTimeout(async () => {
-    await setTrayMenu([
-      await MenuItemExit(t('tray.exit')),
-      await MenuItemShow(t('tray.show')),
-    ])
+  if (managementReady.value) {
+    clientRunning.value = await isClientRunning().catch(() => false)
+  }
+  const timer = setInterval(async () => {
+    if (!managementReady.value) return
+    try {
+      clientRunning.value = await isClientRunning()
+      if (clientRunning.value) {
+        // Recover warnings even if a lifecycle event was missed during UI attachment.
+        const status = await getManagementStatus().catch(() => undefined)
+        if (status) reportManagementWarning(status.last_outcome)
+      }
+    } catch (e) {
+      clientRunning.value = false
+      console.error("Error checking client running status", e)
+    }
   }, 1000)
-})
-onUnmounted(() => clearInterval(intervalId))
 
-const activeStep = computed(() => {
-  return networkStore.networkInstanceIds.includes(networkStore.curNetworkId) ? '2' : '1'
+  onUnmounted(() => {
+    clearInterval(timer)
+  })
+})
+async function reconnectClient() {
+  editingMode.value = JSON.parse(JSON.stringify(currentMode.value));
+  await onModeSave()
+}
+
+onMounted(async () => {
+  window.setTimeout(async () => {
+    await setTrayMenu({ show: t('tray.show'), quit: t('tray.exit') })
+  }, 1000)
 })
 
 let current_log_level = 'off'
 
-const setting_menu = ref()
-const setting_menu_items = ref([
+const log_menu = ref()
+// 从后端获取正确的日志路径
+async function getLogDirPath(): Promise<string> {
+  return await invoke<string>('get_log_dir_path')
+}
+
+const log_menu_items_popup: Ref<MenuItem[]> = ref([
+  ...['off', 'warn', 'info', 'debug', 'trace'].map(level => ({
+    label: () => t(`logging_level_${level}`) + (current_log_level === level ? ' ✓' : ''),
+    command: async () => {
+      current_log_level = level
+      await setLoggingLevel(level)
+    },
+  })),
+  {
+    separator: true,
+  },
+  {
+    label: () => t('logging_open_dir'),
+    icon: 'pi pi-folder-open',
+    command: async () => {
+      // console.log('open log dir', await getLogDirPath())
+      await open(await getLogDirPath())
+    },
+    visible: () => type() !== 'android',
+  },
+  {
+    label: () => t('logging_copy_dir'),
+    icon: 'pi pi-tablet',
+    command: async () => {
+      await writeText(await getLogDirPath())
+    },
+  },
+])
+
+function toggle_log_menu(event: any) {
+  log_menu.value.toggle(event)
+}
+
+function getLabel(item: MenuItem) {
+  return typeof item.label === 'function' ? item.label() : item.label
+}
+
+const setting_menu_items: Ref<MenuItem[]> = ref([
   {
     label: () => t('exchange_language'),
     icon: 'pi pi-language',
     command: async () => {
       await I18nUtils.loadLanguageAsync((locale.value === 'en' ? 'cn' : 'en'))
-      await setTrayMenu([
-        await MenuItemExit(t('tray.exit')),
-        await MenuItemShow(t('tray.show')),
-      ])
+      await setTrayMenu({ show: t('tray.show'), quit: t('tray.exit') })
     },
   },
   {
-    label: () => getAutoLaunchStatus() ? t('disable_auto_launch') : t('enable_auto_launch'),
-    icon: 'pi pi-desktop',
-    command: async () => {
-      await loadAutoLaunchStatusAsync(!getAutoLaunchStatus())
-    },
+    label: () => `${t('mode.switch_mode')}: ${t('mode.' + currentMode.value.mode)}`,
+    icon: 'pi pi-sync',
+    command: openModeDialog,
+    visible: () => type() !== 'android',
   },
   {
+    label: () => t('mode.autostart'),
+    icon: 'pi pi-clock',
+    command: openAutostartDialog,
+    visible: () => type() !== 'android',
+  },
+  {
+    label: () => `${t('config-server.title')}${t('config-server.' + configServerConnectionStatus.value)}`,
+    icon: 'pi pi-globe',
+    command: openConfigServerDialog,
+    visible: () => ["normal", "service"].includes(currentMode.value.mode),
+  },
+  {
+    key: 'logging_menu',
     label: () => t('logging'),
     icon: 'pi pi-file',
-    items: (function () {
-      const levels = ['off', 'warn', 'info', 'debug', 'trace']
-      const items = []
-      for (const level of levels) {
-        items.push({
-          label: () => t(`logging_level_${level}`) + (current_log_level === level ? ' ✓' : ''),
-          command: async () => {
-            current_log_level = level
-            await setLoggingLevel(level)
-          },
-        })
-      }
-      items.push({
-        separator: true,
-      })
-      items.push({
-        label: () => t('logging_open_dir'),
-        icon: 'pi pi-folder-open',
-        command: async () => {
-          // console.log('open log dir', await appLogDir())
-          await open(await appLogDir())
-        },
-      })
-      items.push({
-        label: () => t('logging_copy_dir'),
-        icon: 'pi pi-tablet',
-        command: async () => {
-          await writeText(await appLogDir())
-        },
-      })
-      return items
-    })(),
+    items: [], // Keep this to show it's a parent menu
   },
   {
     label: () => t('about.title'),
@@ -229,153 +494,125 @@ const setting_menu_items = ref([
   },
 ])
 
-function toggle_setting_menu(event: any) {
-  setting_menu.value.toggle(event)
+async function connectRpcClient(isNormalMode: boolean, url?: string) {
+  await initRpcConnection(isNormalMode, url)
+  console.log("easytier rpc connection established, isNormalMode: ", isNormalMode)
 }
 
-onBeforeMount(async () => {
-  networkStore.loadFromLocalStorage()
-  if (type() !== 'android' && getAutoLaunchStatus() && await isAutostart()) {
-    getCurrentWindow().hide()
-    const autoStartIds = networkStore.autoStartInstIds
-    for (const id of autoStartIds) {
-      const cfg = networkStore.networkList.find((item: NetworkTypes.NetworkConfig) => item.instance_id === id)
-      if (cfg) {
-        networkStore.addNetworkInstance(cfg.instance_id)
-        await runNetworkInstance(cfg)
-      }
-    }
-  }
-})
-
-onMounted(async () => {
-  if (type() === 'android') {
-    try {
-      await initMobileVpnService()
-      console.error("easytier init vpn service done")
-    } catch (e: any) {
-      console.error("easytier init vpn service failed", e)
-    }
-  }
-})
-
-function isRunning(id: string) {
-  return networkStore.networkInstanceIds.includes(id)
+async function openConfigServerDialog() {
+  editingMode.value = JSON.parse(JSON.stringify(currentMode.value))
+  configServerDialogVisible.value = true
 }
-</script>
+async function onConfigServerSave() {
+  if (JSON.stringify(currentMode.value) === JSON.stringify(editingMode.value)) {
+    configServerDialogVisible.value = false
+    return;
+  }
+  if (editingMode.value.mode === 'service') {
+    await new Promise<void>((resolve, reject) => {
+      confirm.require({
+        message: t('config-server.update_service_confirm'),
+        icon: 'pi pi-exclamation-triangle',
+        rejectProps: {
+          label: t('web.common.cancel'),
+          severity: 'secondary',
+          outlined: true
+        },
+        acceptProps: {
+          label: t('web.common.confirm'),
+        },
+        accept: async () => {
+          resolve()
+        },
+        reject: () => {
+          reject()
+        }
+      });
+    })
+  }
+  console.log("Saving config server url", (editingMode.value as WebClientConfig).config_server_url)
+  await onModeSave();
+  configServerDialogVisible.value = false
+}
+onMounted(() => {
+  const timer = setInterval(async () => {
+    if (currentMode.value.mode !== 'normal') return;
+    if (!currentMode.value.config_server_url) return;
+    configServerConnected.value = await isWebClientConnected();
+  }, 1000)
 
-<script lang="ts">
+  onUnmounted(() => {
+    clearInterval(timer)
+  })
+})
+const configServerConnectionStatus = computed(() => {
+  if (currentMode.value.mode !== 'normal') {
+    return 'unknown'
+  }
+  if (!currentMode.value.config_server_url) {
+    return 'disconnected'
+  }
+  return configServerConnected.value ? 'connected' : 'connecting'
+})
+
 </script>
 
 <template>
   <div id="root" class="flex flex-col">
-    <Dialog v-model:visible="visible" modal header="Config File" :style="{ width: '70%' }">
-      <Panel>
-        <ScrollPanel style="width: 100%; height: 300px">
-          <pre>{{ tomlConfig }}</pre>
-        </ScrollPanel>
-      </Panel>
-      <Divider />
-      <div class="flex gap-2 justify-end">
-        <Button type="button" :label="t('close')" @click="visible = false" />
-      </div>
-    </Dialog>
-
     <Dialog v-model:visible="aboutVisible" modal :header="t('about.title')" :style="{ width: '70%' }">
       <About />
     </Dialog>
+    <Dialog v-model:visible="modeDialogVisible" modal :header="t('mode.switch_mode')" :style="{ width: '50vw' }">
+      <Message v-if="showAutostartHint" severity="info" :closable="false" class="mb-4">
+        {{ t('mode.autostart_hint') }}
+      </Message>
+      <ModeSwitcher v-model="editingMode" @uninstall-service="onUninstallService" @stop-service="onStopService" />
+      <template #footer>
+        <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="modeDialogVisible = false" text />
+        <Button :label="t('web.common.save')" icon="pi pi-save" @click="onModeSave" autofocus :loading="isModeSaving" />
+      </template>
+    </Dialog>
 
-    <div>
-      <Toolbar>
-        <template #start>
-          <div class="flex items-center">
-            <Button icon="pi pi-plus" severity="primary" :label="t('add_new_network')" @click="addNewNetwork" />
-          </div>
-        </template>
+    <Dialog v-model:visible="configServerDialogVisible" modal :header="t('config-server.title')"
+      :style="{ width: '50vw' }">
+      <div class="flex flex-col gap-3">
+        <label for="config-server-address">{{ t('config-server.address') }}</label>
+        <InputText id="config-server-address" v-model="(editingMode as WebClientConfig).config_server_url"
+          :placeholder="t('config-server.address_placeholder')" />
+        <small class="p-text-secondary whitespace-pre-wrap">{{ t('config-server.description') }}</small>
+      </div>
+      <template #footer>
+        <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="configServerDialogVisible = false" text />
+        <Button :label="t('web.common.save')" icon="pi pi-save" @click="onConfigServerSave" autofocus
+          :loading="isModeSaving" />
+      </template>
+    </Dialog>
 
-        <template #center>
-          <div class="min-w-40">
-            <Select v-model="networkStore.curNetwork" :options="networkStore.networkList" :highlight-on-select="false"
-              :placeholder="t('select_network')" class="w-full">
-              <template #value="slotProps">
-                <div class="flex items-start content-center">
-                  <div class="mr-4 flex-col">
-                    <span>{{ slotProps.value.network_name }}</span>
-                  </div>
-                  <Tag class="my-auto leading-3" :severity="isRunning(slotProps.value.instance_id) ? 'success' : 'info'"
-                    :value="t(isRunning(slotProps.value.instance_id) ? 'network_running' : 'network_stopped')" />
-                </div>
-              </template>
-              <template #option="slotProps">
-                <div class="flex flex-col items-start content-center max-w-full">
-                  <div class="flex">
-                    <div class="mr-4">
-                      {{ t('network_name') }}: {{ slotProps.option.network_name }}
-                    </div>
-                    <Tag class="my-auto leading-3"
-                      :severity="isRunning(slotProps.option.instance_id) ? 'success' : 'info'"
-                      :value="t(isRunning(slotProps.option.instance_id) ? 'network_running' : 'network_stopped')" />
-                  </div>
-                  <div v-if="slotProps.option.networking_method !== NetworkTypes.NetworkingMethod.Standalone"
-                    class="max-w-full overflow-hidden text-ellipsis">
-                    {{ slotProps.option.networking_method === NetworkTypes.NetworkingMethod.Manual
-                      ? slotProps.option.peer_urls.join(', ')
-                      : slotProps.option.public_server_url }}
-                  </div>
-                  <div
-                    v-if="isRunning(slotProps.option.instance_id) && networkStore.instances[slotProps.option.instance_id].detail && (!!networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)">
-                    {{
-                      Utils.ipv4InetToString(networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)
-                    }}
-                  </div>
-                </div>
-              </template>
-            </Select>
-          </div>
-        </template>
+    <Menu ref="log_menu" :model="log_menu_items_popup" :popup="true" />
 
-        <template #end>
-          <Button icon="pi pi-cog" severity="secondary" aria-haspopup="true" :label="t('settings')"
-            aria-controls="overlay_setting_menu" @click="toggle_setting_menu" />
-          <TieredMenu id="overlay_setting_menu" ref="setting_menu" :model="setting_menu_items" :popup="true" />
-        </template>
-      </Toolbar>
+    <RemoteManagement v-if="clientRunning" class="flex-1 overflow-y-auto" :api="remoteClient"
+      :pause-auto-refresh="isModeSaving" v-model:instance-id="instanceId" />
+    <div v-else class="empty-state flex-1 flex flex-col items-center py-12">
+      <i class="pi pi-server text-5xl text-secondary mb-4 opacity-50"></i>
+      <div class="text-xl text-center font-medium mb-3">{{ t('client.not_running') }}
+      </div>
+      <Button @click="reconnectClient" :loading="isModeSaving" :label="t('client.retry')" icon="pi pi-replay"
+        iconPos="left" />
     </div>
 
-    <Panel class="h-full overflow-y-auto">
-      <Stepper :value="activeStep">
-        <StepList value="1">
-          <Step value="1">
-            {{ t('config_network') }}
-          </Step>
-          <Step value="2">
-            {{ t('running') }}
-          </Step>
-        </StepList>
-        <StepPanels value="1">
-          <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="1">
-            <Config :instance-id="networkStore.curNetworkId" :config-invalid="messageBarSeverity !== Severity.None"
-              :cur-network="curNetworkConfig" @run-network="runNetworkCb($event, () => activateCallback('2'))" />
-          </StepPanel>
-          <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="2">
-            <div class="flex flex-col">
-              <Status :cur-network-inst="curNetworkInst" />
-            </div>
-            <div class="flex pt-6 justify-center">
-              <Button :label="t('stop_network')" severity="danger" icon="pi pi-arrow-left"
-                @click="stopNetworkCb(networkStore.curNetwork, () => activateCallback('1'))" />
-            </div>
-          </StepPanel>
-        </StepPanels>
-      </Stepper>
-    </Panel>
-
-    <div>
-      <Menubar :model="items" breakpoint="300px" />
-      <InlineMessage v-if="messageBarSeverity !== Severity.None" class="absolute bottom-0 right-0" severity="error">
-        {{ messageBarContent }}
-      </InlineMessage>
-    </div>
+    <Menubar :model="setting_menu_items" breakpoint="795px">
+      <template #item="{ item, props }">
+        <a v-if="item.key === 'logging_menu'" v-bind="props.action" @click="toggle_log_menu">
+          <span :class="item.icon" />
+          <span class="p-menubar-item-label">{{ getLabel(item) }}</span>
+          <span class="pi pi-angle-down p-menubar-item-icon text-[9px]"></span>
+        </a>
+        <a v-else v-bind="props.action">
+          <span :class="item.icon" />
+          <span class="p-menubar-item-label">{{ getLabel(item) }}</span>
+        </a>
+      </template>
+    </Menubar>
   </div>
 </template>
 

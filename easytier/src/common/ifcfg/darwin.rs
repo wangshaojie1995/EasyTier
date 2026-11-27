@@ -1,10 +1,44 @@
-use std::net::Ipv4Addr;
+use std::{collections::BTreeSet, net::Ipv4Addr};
 
+use super::{
+    Error, IfConfiguerTrait, cidr_to_subnet_mask, ignore_removed_shell_cmd_not_found, run_shell_cmd,
+};
 use async_trait::async_trait;
+use cidr::{Ipv4Inet, Ipv6Inet};
+use tokio::sync::Mutex;
 
-use super::{cidr_to_subnet_mask, run_shell_cmd, Error, IfConfiguerTrait};
+#[derive(Default)]
+pub struct MacIfConfiger {
+    configured_ipv4: Mutex<BTreeSet<Ipv4Inet>>,
+}
 
-pub struct MacIfConfiger {}
+impl MacIfConfiger {
+    fn build_add_ipv4_cmd(name: &str, addr: Ipv4Inet, has_configured_ipv4: bool) -> String {
+        let address = addr.address();
+        if has_configured_ipv4 {
+            format!(
+                "ifconfig {} alias {:?} {:?} netmask {}",
+                name,
+                address,
+                address,
+                cidr_to_subnet_mask(addr.network_length())
+            )
+        } else {
+            format!(
+                "ifconfig {} {:?}/{:?} {:?} up",
+                name,
+                address,
+                addr.network_length(),
+                address,
+            )
+        }
+    }
+}
+
+async fn run_delete_shell_cmd(cmd: &str) -> Result<(), Error> {
+    ignore_removed_shell_cmd_not_found(run_shell_cmd(cmd).await)
+}
+
 #[async_trait]
 impl IfConfiguerTrait for MacIfConfiger {
     async fn add_ipv4_route(
@@ -12,13 +46,31 @@ impl IfConfiguerTrait for MacIfConfiger {
         name: &str,
         address: Ipv4Addr,
         cidr_prefix: u8,
+        cost: Option<i32>,
     ) -> Result<(), Error> {
+        self.add_ipv4_route_with_source_hint(name, address, cidr_prefix, cost, None)
+            .await
+    }
+
+    async fn add_ipv4_route_with_source_hint(
+        &self,
+        name: &str,
+        address: Ipv4Addr,
+        cidr_prefix: u8,
+        cost: Option<i32>,
+        source_hint: Option<Ipv4Addr>,
+    ) -> Result<(), Error> {
+        let source_hint = source_hint
+            .map(|source| format!(" -ifa {}", source))
+            .unwrap_or_default();
         run_shell_cmd(
             format!(
-                "route -n add {} -netmask {} -interface {} -hopcount 7",
+                "route -n add {} -netmask {} -interface {}{} -hopcount {}",
                 address,
                 cidr_to_subnet_mask(cidr_prefix),
-                name
+                name,
+                source_hint,
+                cost.unwrap_or(7)
             )
             .as_str(),
         )
@@ -31,7 +83,7 @@ impl IfConfiguerTrait for MacIfConfiger {
         address: Ipv4Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
-        run_shell_cmd(
+        run_delete_shell_cmd(
             format!(
                 "route -n delete {} -netmask {} -interface {}",
                 address,
@@ -49,14 +101,15 @@ impl IfConfiguerTrait for MacIfConfiger {
         address: Ipv4Addr,
         cidr_prefix: u8,
     ) -> Result<(), Error> {
-        run_shell_cmd(
-            format!(
-                "ifconfig {} {:?}/{:?} 10.8.8.8 up",
-                name, address, cidr_prefix,
-            )
-            .as_str(),
-        )
-        .await
+        let addr = Ipv4Inet::new(address, cidr_prefix).map_err(|err| {
+            anyhow::anyhow!("invalid IPv4 address {address}/{cidr_prefix}: {err:?}")
+        })?;
+        let mut configured_ipv4 = self.configured_ipv4.lock().await;
+        let cmd = Self::build_add_ipv4_cmd(name, addr, !configured_ipv4.is_empty());
+
+        run_shell_cmd(cmd.as_str()).await?;
+        configured_ipv4.insert(addr);
+        Ok(())
     }
 
     async fn set_link_status(&self, name: &str, up: bool) -> Result<(), Error> {
@@ -64,18 +117,81 @@ impl IfConfiguerTrait for MacIfConfiger {
             .await
     }
 
-    async fn remove_ip(&self, name: &str, ip: Option<Ipv4Addr>) -> Result<(), Error> {
-        if ip.is_none() {
-            run_shell_cmd(format!("ifconfig {} inet delete", name).as_str()).await
-        } else {
-            run_shell_cmd(
-                format!("ifconfig {} inet {} delete", name, ip.unwrap().to_string()).as_str(),
+    async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
+        let mut configured_ipv4 = self.configured_ipv4.lock().await;
+        if let Some(ip) = ip {
+            run_delete_shell_cmd(
+                format!("ifconfig {} inet {} delete", name, ip.address()).as_str(),
             )
-            .await
+            .await?;
+            configured_ipv4.remove(&ip);
+        } else {
+            run_delete_shell_cmd(format!("ifconfig {} inet delete", name).as_str()).await?;
+            configured_ipv4.clear();
         }
+        Ok(())
     }
 
     async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), Error> {
         run_shell_cmd(format!("ifconfig {} mtu {}", name, mtu).as_str()).await
+    }
+
+    async fn add_ipv6_ip(
+        &self,
+        name: &str,
+        address: std::net::Ipv6Addr,
+        cidr_prefix: u8,
+    ) -> Result<(), Error> {
+        run_shell_cmd(format!("ifconfig {} inet6 {}/{} add", name, address, cidr_prefix).as_str())
+            .await
+    }
+
+    async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
+        if let Some(ip) = ip {
+            run_delete_shell_cmd(
+                format!("ifconfig {} inet6 {} delete", name, ip.address()).as_str(),
+            )
+            .await
+        } else {
+            // Remove all IPv6 addresses is more complex on macOS, just succeed
+            Ok(())
+        }
+    }
+
+    async fn add_ipv6_route(
+        &self,
+        name: &str,
+        address: std::net::Ipv6Addr,
+        cidr_prefix: u8,
+        cost: Option<i32>,
+    ) -> Result<(), Error> {
+        let cmd = if let Some(cost) = cost {
+            format!(
+                "route -n add -inet6 {}/{} -interface {} -hopcount {}",
+                address, cidr_prefix, name, cost
+            )
+        } else {
+            format!(
+                "route -n add -inet6 {}/{} -interface {}",
+                address, cidr_prefix, name
+            )
+        };
+        run_shell_cmd(cmd.as_str()).await
+    }
+
+    async fn remove_ipv6_route(
+        &self,
+        name: &str,
+        address: std::net::Ipv6Addr,
+        cidr_prefix: u8,
+    ) -> Result<(), Error> {
+        run_delete_shell_cmd(
+            format!(
+                "route -n delete -inet6 {}/{} -interface {}",
+                address, cidr_prefix, name
+            )
+            .as_str(),
+        )
+        .await
     }
 }

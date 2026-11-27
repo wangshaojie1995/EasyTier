@@ -14,12 +14,23 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "deb": {
+        "depends": [
+          "pkexec | policykit-1"
+        ]
+      }
+    }
   },
   "productName": "easytier-gui",
-  "version": "2.2.0",
+  "version": "2.7.1",
   "identifier": "com.kkrainbow.easytier",
-  "plugins": {},
+  "plugins": {
+    "shell": {
+      "open": "^.+"
+    }
+  },
   "app": {
     "windows": [
       {
